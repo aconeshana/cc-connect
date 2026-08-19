@@ -1035,7 +1035,10 @@ func main() {
 	}
 
 	var startErrors []error
-	for _, e := range engines {
+	apiSocketPath := core.APISocketPath(cfg.DataDir)
+	for i, e := range engines {
+		e.SetSessionHostRouter(core.NewSessionHostRouter(
+			cfg.DataDir, cfg.Projects[i].Name, apiSocketPath))
 		if err := e.Start(); err != nil {
 			slog.Warn("engine start partially failed (some platforms may be unavailable)", "error", err)
 			startErrors = append(startErrors, err)
@@ -1275,7 +1278,7 @@ func main() {
 	}
 
 	// Start internal API server for CLI send
-	apiSrv, err := core.NewAPIServer(cfg.DataDir)
+	apiSrv, err := core.NewAPIServerAt(cfg.DataDir, apiSocketPath)
 	if err != nil {
 		slog.Warn("api server unavailable", "error", err)
 	} else {

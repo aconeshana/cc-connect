@@ -43,6 +43,30 @@ func TestHandleSend_AllowsAttachmentOnly(t *testing.T) {
 	}
 }
 
+func TestHandleCardActionRejectsNonCardActionPrefix(t *testing.T) {
+	agent := &stubSessionEffortAgent{current: "auto"}
+	engine := NewEngine("test", agent, nil, "", LangEnglish)
+	engine.sessions.GetOrCreateActive("feishu:thread").SetAgentSessionID("java-session", "sessionhost")
+	api := &APIServer{engines: map[string]*Engine{"test": engine}}
+	body, err := json.Marshal(CardActionRequest{
+		Project: "test", SessionKey: "feishu:thread", Action: "cmd:/reasoning 2",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/card-action", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.handleCardAction(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if agent.setCalls != 0 {
+		t.Fatalf("invalid card action reached engine: setCalls=%d", agent.setCalls)
+	}
+}
+
 func TestHandleSend_AllowsTTSTextOnly(t *testing.T) {
 	tts := &recordingTTS{}
 	platform := &audioStubPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}

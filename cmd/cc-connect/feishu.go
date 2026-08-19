@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/chenhg5/cc-connect/config"
+	"github.com/chenhg5/cc-connect/core"
 	qrterminal "github.com/mdp/qrterminal/v3"
 	"rsc.io/qr"
 )
@@ -83,6 +85,82 @@ type registrationFlowResult struct {
 	Platform    string // feishu or lark
 }
 
+const maxFeishuCredentialPayloadBytes = 64 << 10
+
+type feishuDiscoveredTarget struct {
+	SessionKey string
+	ChatID     string
+	UserID     string
+}
+
+func readFeishuAppCredentials(r io.Reader) (string, string, error) {
+	if r == nil {
+		return "", "", fmt.Errorf("credential input is unavailable")
+	}
+	data, err := io.ReadAll(io.LimitReader(r, maxFeishuCredentialPayloadBytes+1))
+	if err != nil {
+		return "", "", fmt.Errorf("read credential input: %w", err)
+	}
+	if len(data) > maxFeishuCredentialPayloadBytes {
+		return "", "", fmt.Errorf("credential input exceeds %d bytes", maxFeishuCredentialPayloadBytes)
+	}
+	var payload struct {
+		AppID     string `json:"app_id"`
+		AppSecret string `json:"app_secret"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return "", "", fmt.Errorf("decode credential input: %w", err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return "", "", fmt.Errorf("credential input must contain one JSON object")
+	}
+	appID := strings.TrimSpace(payload.AppID)
+	appSecret := strings.TrimSpace(payload.AppSecret)
+	if appID == "" || appSecret == "" {
+		return "", "", fmt.Errorf("app_id and app_secret are required")
+	}
+	return appID, appSecret, nil
+}
+
+func discoverFeishuTarget(ctx context.Context, platform core.Platform) (feishuDiscoveredTarget, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if platform == nil {
+		return feishuDiscoveredTarget{}, fmt.Errorf("feishu discovery platform is unavailable")
+	}
+	targets := make(chan feishuDiscoveredTarget, 1)
+	if err := platform.Start(func(p core.Platform, msg *core.Message) {
+		if msg == nil || strings.TrimSpace(msg.SessionKey) == "" || strings.TrimSpace(msg.UserID) == "" {
+			return
+		}
+		parts := strings.SplitN(msg.SessionKey, ":", 3)
+		if len(parts) != 3 || !strings.EqualFold(parts[0], p.Name()) || strings.TrimSpace(parts[1]) == "" {
+			return
+		}
+		target := feishuDiscoveredTarget{
+			SessionKey: strings.TrimSpace(msg.SessionKey),
+			ChatID:     strings.TrimSpace(parts[1]),
+			UserID:     strings.TrimSpace(msg.UserID),
+		}
+		select {
+		case targets <- target:
+		default:
+		}
+	}); err != nil {
+		return feishuDiscoveredTarget{}, fmt.Errorf("start feishu target discovery: %w", err)
+	}
+	defer platform.Stop()
+	select {
+	case <-ctx.Done():
+		return feishuDiscoveredTarget{}, ctx.Err()
+	case target := <-targets:
+		return target, nil
+	}
+}
+
 func runFeishu(args []string) {
 	if len(args) == 0 {
 		printFeishuUsage()
@@ -96,6 +174,8 @@ func runFeishu(args []string) {
 		runFeishuSetup(args[1:], feishuSetupModeNew)
 	case "bind", "link":
 		runFeishuSetup(args[1:], feishuSetupModeBind)
+	case "resume", "continue":
+		runFeishuTargetResume(args[1:])
 	case "help", "--help", "-h":
 		printFeishuUsage()
 	default:
@@ -103,6 +183,79 @@ func runFeishu(args []string) {
 		printFeishuUsage()
 		os.Exit(1)
 	}
+}
+
+func runFeishuTargetResume(args []string) {
+	fs := flag.NewFlagSet("feishu resume", flag.ExitOnError)
+	configFile := fs.String("config", "", "path to config file")
+	project := fs.String("project", "", "project name (optional if only one project)")
+	timeout := fs.Int("timeout", 600, "target discovery timeout in seconds")
+	_ = fs.Parse(args)
+
+	initConfigPath(*configFile)
+	targetProject, err := resolveTargetProject(*project)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	platformType, appID, appSecret, err := loadFeishuResumeCredentials(targetProject)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: resume Feishu setup: %v\n", err)
+		os.Exit(1)
+	}
+	platform, err := core.CreatePlatform(platformType, map[string]any{
+		"app_id": appID, "app_secret": appSecret,
+		"thread_isolation": true, "enable_feishu_card": false,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: create Feishu discovery client failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Continue setup by sending one message to the Feishu bot in the chat you want to use...")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
+	target, err := discoverFeishuTarget(ctx, platform)
+	cancel()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: discover Feishu collaboration target failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := config.SaveSessionHostFeishuTarget(config.SessionHostFeishuTargetOptions{
+		ProjectName: targetProject, SessionKey: target.SessionKey,
+		ChatID: target.ChatID, UserID: target.UserID,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: bind Session Host collaboration target failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ Feishu collaboration target connected.")
+}
+
+func loadFeishuResumeCredentials(projectName string) (string, string, string, error) {
+	cfg, err := config.Load(config.ConfigPath)
+	if err != nil {
+		return "", "", "", err
+	}
+	for _, project := range cfg.Projects {
+		if project.Name != projectName {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(project.Agent.Type), "sessionhost") {
+			return "", "", "", fmt.Errorf("project %q must use the sessionhost agent", projectName)
+		}
+		for _, platform := range project.Platforms {
+			platformType := strings.ToLower(strings.TrimSpace(platform.Type))
+			if platformType != "feishu" && platformType != "lark" {
+				continue
+			}
+			appID, _ := platform.Options["app_id"].(string)
+			appSecret, _ := platform.Options["app_secret"].(string)
+			if strings.TrimSpace(appID) == "" || strings.TrimSpace(appSecret) == "" {
+				return "", "", "", fmt.Errorf("saved app_id/app_secret are missing")
+			}
+			return platformType, strings.TrimSpace(appID), strings.TrimSpace(appSecret), nil
+		}
+		return "", "", "", fmt.Errorf("project %q has no Feishu/Lark platform", projectName)
+	}
+	return "", "", "", fmt.Errorf("project %q not found", projectName)
 }
 
 func runFeishuSetup(args []string, requestedMode string) {
@@ -114,6 +267,9 @@ func runFeishuSetup(args []string, requestedMode string) {
 	app := fs.String("app", "", "existing bot credentials in app_id:app_secret format")
 	appID := fs.String("app-id", "", "existing bot app_id")
 	appSecret := fs.String("app-secret", "", "existing bot app_secret")
+	appStdin := fs.Bool("app-stdin", false, "read existing bot credentials as JSON from stdin")
+	credentialEnv := fs.String("credential-env", "", "store credentials in an owner-only dotenv file")
+	discoverTarget := fs.Bool("discover-target", false, "wait for a bot message and bind that Feishu chat to Session Host")
 	timeout := fs.Int("timeout", 600, "QR onboarding timeout in seconds")
 	qrImage := fs.String("qr-image", "", "save QR code as PNG image to this path (e.g. qr.png)")
 	setAllowFromEmpty := fs.Bool("set-allow-from-empty", false, "merge owner open_id into allow_from when onboarding returns it (preserves *)")
@@ -122,11 +278,25 @@ func runFeishuSetup(args []string, requestedMode string) {
 
 	initConfigPath(*configFile)
 
+	if *appStdin && (strings.TrimSpace(*app) != "" || strings.TrimSpace(*appID) != "" || strings.TrimSpace(*appSecret) != "") {
+		fmt.Fprintln(os.Stderr, "Error: --app-stdin cannot be combined with --app, --app-id, or --app-secret")
+		os.Exit(1)
+	}
+	stdinAppID, stdinAppSecret := "", ""
+	if *appStdin {
+		var err error
+		stdinAppID, stdinAppSecret, err = readFeishuAppCredentials(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	effectiveMode, resolvedAppID, resolvedAppSecret, err := resolveFeishuSetupInputs(
 		requestedMode,
 		*app,
-		*appID,
-		*appSecret,
+		firstNonEmpty(stdinAppID, *appID),
+		firstNonEmpty(stdinAppSecret, *appSecret),
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -203,12 +373,27 @@ func runFeishuSetup(args []string, requestedMode string) {
 		fmt.Printf("Project %q had no Feishu/Lark platform, added one automatically.\n", targetProject)
 	}
 
+	storedAppID, storedAppSecret := resolvedAppID, resolvedAppSecret
+	if strings.TrimSpace(*credentialEnv) != "" {
+		if err := config.SaveCredentialEnv(*credentialEnv, map[string]string{
+			"FEISHU_APP_ID": resolvedAppID, "FEISHU_APP_SECRET": resolvedAppSecret,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: save credential env failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := config.SaveEnvFilePath(*credentialEnv); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: update env_file failed: %v\n", err)
+			os.Exit(1)
+		}
+		storedAppID, storedAppSecret = "${FEISHU_APP_ID}", "${FEISHU_APP_SECRET}"
+	}
+
 	saveResult, err := config.SaveFeishuPlatformCredentials(config.FeishuCredentialUpdateOptions{
 		ProjectName:       targetProject,
 		PlatformIndex:     *platformIndex,
 		PlatformType:      finalPlatformType,
-		AppID:             resolvedAppID,
-		AppSecret:         resolvedAppSecret,
+		AppID:             storedAppID,
+		AppSecret:         storedAppSecret,
 		OwnerOpenID:       ownerOpenID,
 		SetAllowFromEmpty: *setAllowFromEmpty,
 	})
@@ -224,6 +409,33 @@ func runFeishuSetup(args []string, requestedMode string) {
 		fmt.Printf("   allow_from: %s\n", saveResult.AllowFrom)
 	}
 	fmt.Println()
+
+	if *discoverTarget {
+		platform, err := core.CreatePlatform(provisionType, map[string]any{
+			"app_id": resolvedAppID, "app_secret": resolvedAppSecret,
+			"thread_isolation": true, "enable_feishu_card": false,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: create Feishu discovery client failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Send one message to the Feishu bot in the chat you want to use for collaboration...")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
+		target, err := discoverFeishuTarget(ctx, platform)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: discover Feishu collaboration target failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := config.SaveSessionHostFeishuTarget(config.SessionHostFeishuTargetOptions{
+			ProjectName: targetProject, SessionKey: target.SessionKey,
+			ChatID: target.ChatID, UserID: target.UserID,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: bind Session Host collaboration target failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✅ Feishu collaboration target connected.")
+	}
 
 	if ownerOpenID != "" {
 		printAllowFromGuidance(resolvedAppID, resolvedAppSecret, ownerOpenID, saveResult)
@@ -351,6 +563,7 @@ Commands:
   setup   Unified entry: no credentials => NEW flow; with --app/--app-id => BIND flow
   new     Force NEW flow (QR onboarding). Rejects --app/--app-id.
   bind    Force BIND flow (requires app_id/app_secret).
+  resume  Continue target discovery using credentials already saved in config/env_file.
 
 Options:
   --config <path>             Path to config file
@@ -360,6 +573,9 @@ Options:
   --app <id:secret>           Existing credentials (recommended for bind/setup)
   --app-id <id>               Existing app_id
   --app-secret <secret>       Existing app_secret
+  --app-stdin                 Read {"app_id","app_secret"} JSON from stdin
+  --credential-env <path>     Store credentials outside TOML with mode 0600
+  --discover-target           Bind the chat where the user next messages the bot
   --timeout <seconds>         QR onboarding timeout (default: 600)
   --qr-image <path>           Save QR code as PNG image file (e.g. --qr-image qr.png)
   --set-allow-from-empty      Merge owner open_id into allow_from when available (default: false)
@@ -375,6 +591,15 @@ Examples:
 
   # Use only when you must force QR onboarding
   cc-connect feishu new --project my-project --platform-type lark`)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func resolveFeishuSetupInputs(mode, app, appID, appSecret string) (effectiveMode, resolvedAppID, resolvedAppSecret string, err error) {

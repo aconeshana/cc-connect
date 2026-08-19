@@ -230,6 +230,7 @@ func newCUJEnv(t *testing.T) *cujEnv {
 	agent := &cujAgent{}
 	storePath := dir + "/sessions.json"
 	e := NewEngine("test", agent, []Platform{plat}, storePath, LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 	return &cujEnv{
 		t:       t,
 		engine:  e,
@@ -1127,6 +1128,7 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
@@ -1162,6 +1164,7 @@ func TestCUJ_A4_VoiceMessageWithoutSTTSurfacesClearMessage(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:voice", Platform: "test", MessageID: "v1",
@@ -1191,6 +1194,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1458,6 +1462,38 @@ func TestCUJ_C6_ModeSwitchAcknowledged(t *testing.T) {
 	// User must get SOME feedback that the mode change registered.
 	if env.lastSent() == "" {
 		t.Fatal("/mode yolo got no user-visible feedback")
+	}
+}
+
+// CUJ-B13 · A semantic Session Host model switch targets the IM thread's
+// bound Java session and keeps its live PTY attachment intact.
+func TestCUJ_B13_SessionHostModelSwitchKeepsLivePTY(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	agent := &stubSessionModelAgent{states: map[string]SessionModelState{
+		"java-session-1": {
+			Current: "sonnet",
+			Models:  []ModelOption{{Name: "sonnet", Alias: "sol"}, {Name: "opus"}},
+		},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "feishu:chat:root:thread-1"
+	e.sessions.GetOrCreateActive(sessionKey).SetAgentSessionID("java-session-1", "sessionhost")
+	live := &stubAgentSession{}
+	e.interactiveStates[sessionKey] = &interactiveState{agentSession: live}
+
+	e.cmdModel(p, &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}, []string{"sol"})
+
+	if agent.lastSet != "java-session-1" || agent.lastName != "sonnet" {
+		t.Fatalf("model switch targeted session=%q model=%q", agent.lastSet, agent.lastName)
+	}
+	if state := e.interactiveStates[sessionKey]; state == nil || state.agentSession != live {
+		t.Fatal("session-scoped model switch detached the live PTY")
+	}
+	if got := e.sessions.GetOrCreateActive(sessionKey).GetAgentSessionID(); got != "java-session-1" {
+		t.Fatalf("agent session id = %q, want java-session-1", got)
+	}
+	if sent := p.getSent(); len(sent) != 1 || !strings.Contains(sent[0], "sonnet") {
+		t.Fatalf("model acknowledgement = %#v", sent)
 	}
 }
 
@@ -1965,6 +2001,7 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	pB := &stubPlatformEngine{n: "platB"}
 	agent := &cujAgent{}
 	e := NewEngine("test", agent, []Platform{pA, pB}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	// Fire 5 messages on each platform concurrently.
 	var wg sync.WaitGroup
@@ -2325,6 +2362,88 @@ func TestCUJ_STREAM1_StreamingResumesAfterPermissionPrompt(t *testing.T) {
 			t.Fatalf("post-resolution text was bulk-sent via plain Send (regression: streaming broken after permission prompt). getSent=%#v", plat.getSent())
 		}
 	}
+}
+
+// ===========================================================================
+// CUJ-ASK-OTHER-1 · A user sees an explicit Other action, taps it, sees the
+// same card switch to custom-input mode, then types a natural-language answer.
+// The Agent must resume only after that text reply, and the card must finish
+// with the custom answer instead of treating the Other callback as the answer.
+//
+// ≥3 user actions: (1) send prompt, (2) tap Other, (3) type custom answer.
+// ===========================================================================
+
+func TestCUJ_ASK_OTHER1_ExplicitOtherUsesNextTextReply(t *testing.T) {
+	dir := t.TempDir()
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	agent := &cujAgent{}
+	e := NewEngine("test", agent, []Platform{p}, dir+"/sessions.json", LangEnglish)
+	defer e.Stop()
+
+	agent.setNextSessionEvents([]Event{
+		{
+			Type:      EventPermissionRequest,
+			ToolName:  "AskUserQuestion",
+			RequestID: "req-cuj-other-1",
+			ToolInputRaw: map[string]any{
+				"questions": []any{},
+			},
+			Questions: []UserQuestion{{
+				Question: "Which datastore should we use?",
+				Options: []UserQuestionOption{
+					{Label: "PostgreSQL"},
+					{Label: "SQLite"},
+				},
+			}},
+		},
+		{Type: EventText, Content: "custom answer accepted; continuing now"},
+		{Type: EventResult, Content: "done with Redis cluster", Done: true},
+	}, 0)
+
+	key := "feishu:olivia"
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: "feishu", MessageID: "m-start",
+		UserID: "olivia", UserName: "olivia", Content: "choose a datastore", ReplyCtx: "ctx-olivia",
+	})
+
+	questionCard := waitForSentCard(t, &p.stubCardPlatform)
+	rows := questionCard.CollectButtons()
+	if len(rows) != 3 || rows[2][0].Data != "askq:req-cuj-other-1:0:other" {
+		t.Fatalf("question card does not expose request-bound Other: %#v", rows)
+	}
+
+	// Action 2: tap Other through the same public engine entrypoint used by IMs.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: "feishu", MessageID: "m-other",
+		UserID: "olivia", UserName: "olivia", Content: rows[2][0].Data, ReplyCtx: "ctx-olivia",
+		IsInteractionResponse: true, InteractionRequestID: "req-cuj-other-1",
+	})
+	customCard := waitForUpdatedCard(t, p)
+	if customCard.HasButtons() || !strings.Contains(customCard.RenderText(), "next text message") {
+		t.Fatalf("Other did not switch the same card into custom-input mode: %s", customCard.RenderText())
+	}
+
+	// Action 3: the next natural-language reply is the answer and resumes Agent.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: "feishu", MessageID: "m-custom",
+		UserID: "olivia", UserName: "olivia", Content: "Redis cluster", ReplyCtx: "ctx-olivia",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		updated := append([]*Card(nil), p.updatedCards...)
+		p.mu.Unlock()
+		for _, card := range updated {
+			if strings.Contains(card.RenderText(), "Redis cluster") && !card.HasButtons() {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("custom answer never finalized the original card; updates=%#v", p.updatedCards)
 }
 
 func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {

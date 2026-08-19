@@ -379,8 +379,8 @@ func (p *Platform) apiRequestJSON(method, url string, body any, result any) erro
 
 var _ core.ImageSender = (*Platform)(nil)
 
-// buttonDataPrefix is the prefix for QQ Bot keyboard button_data values.
-// Format: perm:<decision>:<session_key>
+// buttonDataPrefix is retained for compatibility with permission tests and
+// legacy callbacks. AskUserQuestion callbacks use the sibling askq: prefix.
 const buttonDataPrefix = "perm:"
 
 // SendFile uploads and sends a file via QQ Bot rich media API.
@@ -1070,38 +1070,51 @@ func (p *Platform) handleInteractionCreate(data json.RawMessage) {
 	// ACK the interaction (required by QQ Bot API to prevent "请求超时" on buttons)
 	_ = p.ackInteraction(d.ID)
 
-	// Parse button_data: perm:<decision>:<session_key>
+	// Parse button_data: <interaction-action>:<session_key>
 	buttonData := d.Data.Resolved.ButtonData
-	if !strings.HasPrefix(buttonData, buttonDataPrefix) {
+	if !strings.HasPrefix(buttonData, buttonDataPrefix) && !strings.HasPrefix(buttonData, "askq:") {
 		slog.Debug("qqbot: unknown interaction button_data format", "data", buttonData)
 		return
 	}
 
-	rest := strings.TrimPrefix(buttonData, buttonDataPrefix)
-	// rest = "<decision>:<session_key>"
-	colonIdx := strings.Index(rest, ":")
-	if colonIdx < 0 {
+	// The action is either perm:<decision> or
+	// perm:<request-id>:<decision>. Session keys begin with qqbot:, which gives
+	// us an unambiguous boundary even though both components contain colons.
+	sessionMarker := ":qqbot:"
+	markerIdx := strings.Index(buttonData, sessionMarker)
+	if markerIdx < 0 {
 		slog.Warn("qqbot: invalid interaction button_data", "data", buttonData)
 		return
 	}
-	decision := rest[:colonIdx]
-	sessionKey := rest[colonIdx+1:]
-	if decision == "" || sessionKey == "" {
-		slog.Warn("qqbot: empty decision or session_key in button_data", "data", buttonData)
-		return
+	actionData := buttonData[:markerIdx]
+	sessionKey := buttonData[markerIdx+1:]
+	requestID := ""
+	responseText := ""
+	isPermission := false
+	isInteraction := true
+	if strings.HasPrefix(actionData, "perm:") {
+		var decision string
+		var ok bool
+		requestID, decision, ok = core.ParsePermissionAction(actionData)
+		if !ok {
+			slog.Warn("qqbot: invalid permission action", "data", buttonData)
+			return
+		}
+		responseText = map[string]string{
+			"allow": "allow", "deny": "deny", "allow_all": "allow all",
+		}[decision]
+		isPermission = true
+	} else {
+		var ok bool
+		requestID, _, _, ok = core.ParseAskQuestionAction(actionData)
+		if !ok {
+			slog.Warn("qqbot: invalid AskUserQuestion action", "data", buttonData)
+			return
+		}
+		responseText = actionData
 	}
-
-	// Map decision to response text the engine understands
-	var responseText string
-	switch decision {
-	case "allow":
-		responseText = "allow"
-	case "deny":
-		responseText = "deny"
-	case "allow_all":
-		responseText = "allow all"
-	default:
-		slog.Warn("qqbot: unknown interaction decision", "decision", decision)
+	if sessionKey == "" {
+		slog.Warn("qqbot: empty decision or session_key in button_data", "data", buttonData)
 		return
 	}
 
@@ -1131,17 +1144,19 @@ func (p *Platform) handleInteractionCreate(data json.RawMessage) {
 
 	// Create synthetic message and forward to engine as a permission response
 	msg := &core.Message{
-		SessionKey:           sessionKey,
-		Platform:             "qqbot",
-		MessageID:            d.ID,
-		UserID:               userID,
-		Content:              responseText,
-		ReplyCtx:             rctx,
-		IsPermissionResponse: true,
+		SessionKey:            sessionKey,
+		Platform:              "qqbot",
+		MessageID:             d.ID,
+		UserID:                userID,
+		Content:               responseText,
+		ReplyCtx:              rctx,
+		IsPermissionResponse:  isPermission,
+		IsInteractionResponse: isInteraction,
+		InteractionRequestID:  requestID,
 	}
 
 	slog.Debug("qqbot: forwarding button click as permission response",
-		"decision", decision, "session_key", sessionKey, "chat_type", d.ChatType)
+		"action", actionData, "session_key", sessionKey, "chat_type", d.ChatType)
 	p.handler(p, msg)
 }
 

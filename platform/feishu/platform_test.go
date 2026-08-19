@@ -60,7 +60,7 @@ func TestNew_DisabledInteractiveCardsDoesNotStartPreviewCard(t *testing.T) {
 	}
 }
 
-func TestNew_ProgressStyleDefaultLegacy(t *testing.T) {
+func TestNew_ProgressStyleDefaultCard(t *testing.T) {
 	p, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret"})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -69,8 +69,8 @@ func TestNew_ProgressStyleDefaultLegacy(t *testing.T) {
 	if !ok {
 		t.Fatalf("platform type %T does not implement ProgressStyleProvider", p)
 	}
-	if got := sp.ProgressStyle(); got != "legacy" {
-		t.Fatalf("ProgressStyle() = %q, want legacy", got)
+	if got := sp.ProgressStyle(); got != "card" {
+		t.Fatalf("ProgressStyle() = %q, want card", got)
 	}
 }
 
@@ -311,6 +311,166 @@ func TestInteractivePlatform_CardActionPassesCardSenderToHandler(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected card action message")
+	}
+}
+
+func TestInteractivePlatform_PermissionCardRejectsUnauthorizedOperator(t *testing.T) {
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
+		"allow_from": "ou_admin", "allow_chat": "oc_test_chat",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_other_member"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": "perm:req-feishu-1:allow", "session_key": "feishu:oc_test_chat:root:om_root",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("unauthorized permission click response = %#v, want unhandled for shared-WS fanout", resp)
+	}
+	select {
+	case msg := <-msgCh:
+		t.Fatalf("unauthorized permission click reached engine: %#v", msg)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestInteractivePlatform_PermissionCardStaysUnchangedWhenTerminalRejectsCallback(t *testing.T) {
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
+		"allow_from": "ou_admin", "allow_chat": "oc_test_chat",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	ip.handler = func(_ core.Platform, msg *core.Message) {
+		msg.InteractionResult <- core.InteractionOutcome{Stale: true}
+	}
+
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_admin"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": "perm:req-stale:allow", "session_key": "feishu:oc_test_chat:root:om_root",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Card != nil {
+		t.Fatalf("stale permission response = %#v, want error toast without card replacement", resp)
+	}
+}
+
+func TestInteractivePlatform_PermissionCardAllowsAuthorizedOperator(t *testing.T) {
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
+		"allow_from": "ou_admin", "allow_chat": "oc_test_chat",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) {
+		msgCh <- msg
+		msg.InteractionResult <- core.InteractionOutcome{Accepted: true}
+	}
+
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_admin"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": "perm:req-feishu-1:allow", "session_key": "feishu:oc_test_chat:root:om_root",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Card == nil {
+		t.Fatalf("authorized permission click response = %#v, want updated card", resp)
+	}
+	select {
+	case msg := <-msgCh:
+		if msg.Content != "allow" || !msg.IsPermissionResponse || !msg.IsInteractionResponse ||
+			msg.InteractionRequestID != "req-feishu-1" {
+			t.Fatalf("permission response message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("authorized permission click did not reach engine")
+	}
+}
+
+func TestInteractivePlatform_AskQuestionOtherSwitchesCardToCustomInput(t *testing.T) {
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
+		"allow_from": "ou_admin", "allow_chat": "oc_test_chat",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) {
+		msgCh <- msg
+		msg.InteractionResult <- core.InteractionOutcome{Accepted: true}
+	}
+
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_admin"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action":             "askq:req-other-feishu:0:other",
+				"session_key":        "feishu:oc_test_chat:root:om_root",
+				"askq_question":      "Which database?",
+				"askq_custom_title":  "✏️ Custom answer",
+				"askq_custom_prompt": "Reply in this thread with your custom answer.",
+				"askq_custom_note":   "Your next text message will be submitted as this answer.",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Card == nil || resp.Toast != nil {
+		t.Fatalf("Other response = %#v, want in-place custom-input card", resp)
+	}
+	cardData, ok := resp.Card.Data.(map[string]any)
+	if !ok || !panelContains(t, cardData, "Custom answer") ||
+		!panelContains(t, cardData, "next text message") {
+		t.Fatalf("custom-input card data = %#v", resp.Card.Data)
+	}
+	if panelContains(t, cardData, "✅") {
+		t.Fatalf("Other action must not look resolved before the user types: %#v", cardData)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg.Content != "askq:req-other-feishu:0:other" || !msg.IsInteractionResponse ||
+			msg.InteractionRequestID != "req-other-feishu" || msg.InteractionResult == nil {
+			t.Fatalf("AskUserQuestion Other message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AskUserQuestion Other action did not reach the engine")
 	}
 }
 
@@ -1046,6 +1206,60 @@ func TestBuildPreviewCardJSON_ProgressPayloadUsesStructuredCard(t *testing.T) {
 	header, ok := card["header"].(map[string]any)
 	if !ok || header == nil {
 		t.Fatalf("expected header in card json, got %#v", card["header"])
+	}
+}
+
+func TestProgressAndRichCardsUseReadableSessionTitle(t *testing.T) {
+	payload := core.BuildProgressCardPayloadV2WithTitle([]core.ProgressCardEntry{
+		{Kind: core.ProgressEntryThinking, Text: "planning"},
+	}, false, "CC", "claude-code-java · Improve Feishu titles",
+		core.LangEnglish, core.ProgressCardStateRunning)
+	progress := buildPreviewCardJSON(payload)
+	if !strings.Contains(progress, "claude-code-java · Improve Feishu titles · Running") {
+		t.Fatalf("progress card title missing: %s", progress)
+	}
+	rich := buildRichCard(core.CardStatusDone, "claude-code-java · Improve Feishu titles",
+		nil, "done", false, "")
+	if !strings.Contains(rich, "claude-code-java · Improve Feishu titles · Done") {
+		t.Fatalf("rich card title missing: %s", rich)
+	}
+}
+
+func TestSessionHostProgressCardChromeIsEnglishEvenForChineseConversation(t *testing.T) {
+	payload := core.BuildProgressCardPayloadV2WithTitle([]core.ProgressCardEntry{
+		{Kind: core.ProgressEntryThinking, Text: "正在排查"},
+		{Kind: core.ProgressEntryToolUse, Tool: "Bash", Text: "pwd"},
+	}, true, "CC", "claude-code-java · 排查事件重放",
+		core.LangChinese, core.ProgressCardStateCompleted)
+	cardJSON := buildPreviewCardJSON(payload)
+
+	for _, want := range []string{
+		"claude-code-java · 排查事件重放 · Completed",
+		"Showing latest updates only.",
+		"Reasoning (1)",
+		"Tools (1)",
+		"This progress card is no longer updating. Full response is in the next message.",
+	} {
+		if !strings.Contains(cardJSON, want) {
+			t.Fatalf("English card chrome missing %q: %s", want, cardJSON)
+		}
+	}
+	for _, unwanted := range []string{"已完成", "仅显示最近更新", "思考 (", "工具 (", "本过程卡片"} {
+		if strings.Contains(cardJSON, unwanted) {
+			t.Fatalf("mixed-language card chrome contains %q: %s", unwanted, cardJSON)
+		}
+	}
+}
+
+func TestHostSessionRootContentHidesFullSessionUUID(t *testing.T) {
+	content := hostSessionRootContent(
+		"claude-code-java · Improve Feishu titles",
+		"44eba721-3ace-4a2a-bd1c-3c106d50ca89")
+	if !strings.Contains(content, "Session · `44eba721`") {
+		t.Fatalf("short session ID missing: %q", content)
+	}
+	if strings.Contains(content, "3ace-4a2a") {
+		t.Fatalf("full session UUID leaked: %q", content)
 	}
 }
 
@@ -1937,6 +2151,35 @@ func TestCardAction_NavFast_ReturnsCard(t *testing.T) {
 	}
 }
 
+func TestCardAction_ResumeOwnerUpdated_DoesNotReapplyCallbackCard(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	ip.cardNavHandler = func(action string, sessionKey string) *core.Card {
+		card := core.NewCard().Markdown("authoritative resume result").Build()
+		card.Elements = append(card.Elements, core.CardNote{Tag: core.ResumeCardOwnerUpdatedTag})
+		return card
+	}
+
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": "act:/resume session-target",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_test_message"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Card != nil {
+		t.Fatalf("owner-updated response = %#v, want toast without stale card payload", resp)
+	}
+}
+
 func TestCardAction_NavSlow_ReturnsToastThenRefreshes(t *testing.T) {
 	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
 	if err != nil {
@@ -2022,6 +2265,49 @@ func TestCardAction_NavSlow_NilCard_NoRefresh(t *testing.T) {
 
 	if got := mock.refreshCalled.Load(); got != 0 {
 		t.Fatalf("RefreshCard should not be called for nil card, called %d times", got)
+	}
+}
+
+func TestCardAction_ResumeOwnerUpdatedAfterTimeout_SkipsDelayedRefresh(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	mock := newMockRefreshPlatform(ip.Platform)
+	ip.Platform.self = mock
+	handlerDone := make(chan struct{})
+	ip.cardNavHandler = func(action string, sessionKey string) *core.Card {
+		time.Sleep(cardNavTimeout + 100*time.Millisecond)
+		card := core.NewCard().Markdown("authoritative resume result").Build()
+		card.Elements = append(card.Elements, core.CardNote{Tag: core.ResumeCardOwnerUpdatedTag})
+		close(handlerDone)
+		return card
+	}
+
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": "act:/resume session-target",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_test_message"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Card != nil {
+		t.Fatalf("timeout response = %#v", resp)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resume card handler did not finish")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := mock.refreshCalled.Load(); got != 0 {
+		t.Fatalf("delayed stale resume callback refreshed the card %d times", got)
 	}
 }
 

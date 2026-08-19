@@ -1,9 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/chenhg5/cc-connect/config"
+	"github.com/chenhg5/cc-connect/core"
 )
 
 func TestResolveFeishuSetupInputs_AutoModeWithoutCredentialsUsesNew(t *testing.T) {
@@ -81,5 +88,96 @@ func TestSaveQRCodeImage_InvalidPath(t *testing.T) {
 	err := saveQRCodeImage("https://example.com", "/nonexistent/dir/qr.png")
 	if err == nil {
 		t.Fatal("expected error for invalid path, got nil")
+	}
+}
+
+func TestReadFeishuAppCredentialsFromStdinKeepsSecretOutOfArgv(t *testing.T) {
+	appID, appSecret, err := readFeishuAppCredentials(strings.NewReader(
+		`{"app_id":"cli_existing","app_secret":"sec:with:colons"}`))
+	if err != nil {
+		t.Fatalf("readFeishuAppCredentials returned error: %v", err)
+	}
+	if appID != "cli_existing" || appSecret != "sec:with:colons" {
+		t.Fatalf("credentials = (%q, %q)", appID, appSecret)
+	}
+}
+
+func TestReadFeishuAppCredentialsFromStdinRejectsOversizedOrMissingValues(t *testing.T) {
+	if _, _, err := readFeishuAppCredentials(strings.NewReader(`{"app_id":"","app_secret":"x"}`)); err == nil {
+		t.Fatal("missing app_id unexpectedly accepted")
+	}
+	oversized := strings.NewReader(`{"app_id":"cli_x","app_secret":"` + strings.Repeat("x", 70<<10) + `"}`)
+	if _, _, err := readFeishuAppCredentials(oversized); err == nil {
+		t.Fatal("oversized credential payload unexpectedly accepted")
+	}
+}
+
+func TestLoadFeishuResumeCredentialsFromIncompleteSessionHostConfig(t *testing.T) {
+	t.Setenv("FEISHU_APP_ID", "cli_saved")
+	t.Setenv("FEISHU_APP_SECRET", "secret_saved")
+	path := filepath.Join(t.TempDir(), "cc-connect.toml")
+	err := os.WriteFile(path, []byte(`
+[[projects]]
+name = "demo"
+[projects.agent]
+type = "sessionhost"
+[projects.agent.options]
+work_dir = "/tmp/demo"
+[[projects.platforms]]
+type = "feishu"
+[projects.platforms.options]
+app_id = "${FEISHU_APP_ID}"
+app_secret = "${FEISHU_APP_SECRET}"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := config.ConfigPath
+	config.ConfigPath = path
+	t.Cleanup(func() { config.ConfigPath = previous })
+
+	platformType, appID, appSecret, err := loadFeishuResumeCredentials("demo")
+	if err != nil {
+		t.Fatalf("loadFeishuResumeCredentials returned error: %v", err)
+	}
+	if platformType != "feishu" || appID != "cli_saved" || appSecret != "secret_saved" {
+		t.Fatalf("credentials = (%q, %q, %q)", platformType, appID, appSecret)
+	}
+}
+
+type discoveryPlatform struct {
+	message *core.Message
+}
+
+func (p *discoveryPlatform) Name() string { return "feishu" }
+func (p *discoveryPlatform) Start(handler core.MessageHandler) error {
+	go handler(p, p.message)
+	return nil
+}
+func (p *discoveryPlatform) Reply(context.Context, any, string) error { return nil }
+func (p *discoveryPlatform) Send(context.Context, any, string) error  { return nil }
+func (p *discoveryPlatform) Stop() error                              { return nil }
+
+func TestDiscoverFeishuTargetUsesTheChatWhereTheUserMessagesTheBot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	target, err := discoverFeishuTarget(ctx, &discoveryPlatform{message: &core.Message{
+		SessionKey: "feishu:oc_selected_chat:ou_owner", UserID: "ou_owner",
+	}})
+	if err != nil {
+		t.Fatalf("discoverFeishuTarget returned error: %v", err)
+	}
+	if target.SessionKey != "feishu:oc_selected_chat:ou_owner" ||
+		target.ChatID != "oc_selected_chat" || target.UserID != "ou_owner" {
+		t.Fatalf("target = %#v", target)
+	}
+}
+
+func TestDiscoverFeishuTargetHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := discoverFeishuTarget(ctx, &discoveryPlatform{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
 	}
 }

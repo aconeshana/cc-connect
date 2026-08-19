@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -1060,6 +1061,59 @@ func TestMarkAndIsActiveThreadSession(t *testing.T) {
 			t.Fatal("thread should be active after mark")
 		}
 	})
+}
+
+func TestMakeSessionKeyUsesKnownHostThreadForP2PReply(t *testing.T) {
+	const key = "feishu:oc_chat:root:om_host_root"
+	p := &Platform{platformName: "feishu", threadIsolation: true}
+	p.hostThreadSessions.Store(key, time.Now())
+	chatType := "p2p"
+	rootID := "om_host_root"
+	msg := &larkim.EventMessage{ChatType: &chatType, RootId: &rootID}
+
+	if got := p.makeSessionKey(msg, "oc_chat", "ou_user"); got != key {
+		t.Fatalf("makeSessionKey() = %q, want %q", got, key)
+	}
+}
+
+func TestHostThreadSessionsPersistAcrossPlatformRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	opts := map[string]any{
+		"app_id":             "cli_test",
+		"app_secret":         "secret",
+		"thread_isolation":   true,
+		"enable_feishu_card": false,
+		"cc_data_dir":        dataDir,
+		"cc_project":         "project/with unsafe name",
+	}
+	rawFirst, err := newPlatform("feishu", lark.FeishuBaseUrl, opts)
+	if err != nil {
+		t.Fatalf("newPlatform(first) error = %v", err)
+	}
+	first := rawFirst.(*Platform)
+	const key = "feishu:oc_chat:root:om_persisted"
+	if err := first.rememberHostThreadSession(key); err != nil {
+		t.Fatalf("rememberHostThreadSession() error = %v", err)
+	}
+
+	rawSecond, err := newPlatform("feishu", lark.FeishuBaseUrl, opts)
+	if err != nil {
+		t.Fatalf("newPlatform(second) error = %v", err)
+	}
+	second := rawSecond.(*Platform)
+	if !second.isHostThreadSession(key) || !second.isActiveThreadSession(key) {
+		t.Fatal("persisted host thread was not restored")
+	}
+	info, err := os.Stat(second.hostThreadStorePath)
+	if err != nil {
+		t.Fatalf("stat host thread store: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("host thread store mode = %o, want 600", got)
+	}
+	if strings.Contains(second.hostThreadStorePath, "project/with unsafe name") {
+		t.Fatalf("unsafe project name leaked into path %q", second.hostThreadStorePath)
+	}
 }
 
 // TestOnMessageThreadIsolationAdmitsAttachmentWithoutMention covers the fix

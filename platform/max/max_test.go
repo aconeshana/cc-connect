@@ -272,9 +272,10 @@ func (m *mockAPI) handleUploads(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCDN mimics per-kind MAX CDN response shapes:
-//   image: {"photos": {"<id>": {"token": "..."}}}
-//   file:  {"token": "..."}
-//   video/audio: XML "<retval>1</retval>" (token comes from /uploads instead)
+//
+//	image: {"photos": {"<id>": {"token": "..."}}}
+//	file:  {"token": "..."}
+//	video/audio: XML "<retval>1</retval>" (token comes from /uploads instead)
 func (m *mockAPI) handleCDN(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt32(&m.cdnCalls, 1)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -666,7 +667,6 @@ func TestSendAudio(t *testing.T) {
 	}
 }
 
-
 func TestNormalizeLineBreaks(t *testing.T) {
 	cases := []struct {
 		name, in, want string
@@ -907,5 +907,24 @@ func TestWebhookHandlerWrongMethod(t *testing.T) {
 	pl.webhookHandler(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("got %d, want 405", rec.Code)
+	}
+}
+
+func TestHandleCallbackBindsInteractionRequestID(t *testing.T) {
+	p, _ := New(map[string]any{"token": "t", "allow_from": "*"})
+	pl := p.(*Platform)
+	received := make(chan *core.Message, 1)
+	pl.handler = func(_ core.Platform, msg *core.Message) { received <- msg }
+
+	pl.handleCallback(context.Background(), &maxCallback{
+		CallbackID: "callback-1", Payload: "askq:req-max-1:0:2",
+		User:    maxUser{UserID: 42, Name: "Tester"},
+		Message: maxMessage{Recipient: maxRecipient{ChatID: 99}},
+	})
+
+	msg := <-received
+	if !msg.IsInteractionResponse || msg.InteractionRequestID != "req-max-1" ||
+		msg.Content != "askq:req-max-1:0:2" {
+		t.Fatalf("interaction callback = %#v", msg)
 	}
 }

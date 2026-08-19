@@ -38,6 +38,26 @@ type APIServer struct {
 	mu                 sync.RWMutex
 }
 
+type InboundMessageRequest struct {
+	Project  string  `json:"project"`
+	Platform string  `json:"platform"`
+	Message  Message `json:"message"`
+}
+
+type InboundMessageResponse struct {
+	Interaction InteractionOutcome `json:"interaction"`
+}
+
+type CardActionRequest struct {
+	Project    string `json:"project"`
+	SessionKey string `json:"session_key"`
+	Action     string `json:"action"`
+}
+
+type CardActionResponse struct {
+	Card *CardWire `json:"card,omitempty"`
+}
+
 // SendRequest is the JSON body for POST /send.
 //
 // Audios and Videos are kept separate from Files so the engine can
@@ -64,12 +84,21 @@ type SendRequest struct {
 
 // NewAPIServer creates an API server on a Unix socket.
 func NewAPIServer(dataDir string) (*APIServer, error) {
-	sockDir := filepath.Join(dataDir, "run")
+	return NewAPIServerAt(dataDir, APISocketPath(dataDir))
+}
+
+func APISocketPath(dataDir string) string {
+	if configured := strings.TrimSpace(os.Getenv("CC_CONNECT_API_SOCKET")); configured != "" {
+		return configured
+	}
+	return filepath.Join(dataDir, "run", "api.sock")
+}
+
+func NewAPIServerAt(dataDir, sockPath string) (*APIServer, error) {
+	sockDir := filepath.Dir(sockPath)
 	if err := os.MkdirAll(sockDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
-	sockPath := filepath.Join(sockDir, "api.sock")
-
 	// Remove stale socket
 	os.Remove(sockPath)
 
@@ -90,6 +119,8 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 		maxAttachmentBytes: DefaultMaxAttachmentSize,
 	}
 	s.mux.HandleFunc("/send", s.handleSend)
+	s.mux.HandleFunc("/inbound", s.handleInbound)
+	s.mux.HandleFunc("/card-action", s.handleCardAction)
 	s.mux.HandleFunc("/sessions", s.handleSessions)
 	s.mux.HandleFunc("/cron/add", s.handleCronAdd)
 	s.mux.HandleFunc("/cron/list", s.handleCronList)
@@ -107,6 +138,66 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
 
 	return s, nil
+}
+
+func (s *APIServer) handleCardAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req CardActionRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.Project = strings.TrimSpace(req.Project)
+	req.SessionKey = strings.TrimSpace(req.SessionKey)
+	req.Action = strings.TrimSpace(req.Action)
+	if req.Project == "" || req.SessionKey == "" || req.Action == "" ||
+		len(req.Project) > 512 || len(req.SessionKey) > 4096 || len(req.Action) > 64<<10 ||
+		(!strings.HasPrefix(req.Action, "act:/") && !strings.HasPrefix(req.Action, "nav:/")) {
+		http.Error(w, "invalid card action request", http.StatusBadRequest)
+		return
+	}
+	s.mu.RLock()
+	engine := s.engines[req.Project]
+	s.mu.RUnlock()
+	if engine == nil {
+		http.Error(w, fmt.Sprintf("project %q not found", req.Project), http.StatusNotFound)
+		return
+	}
+	card := engine.handleCardNavLocal(req.Action, req.SessionKey)
+	wire := cardToWire(card)
+	if card != nil && wire == nil {
+		http.Error(w, "card contains an unsupported element", http.StatusInternalServerError)
+		return
+	}
+	apiJSON(w, http.StatusOK, CardActionResponse{Card: wire})
+}
+
+func (s *APIServer) handleInbound(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req InboundMessageRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.RLock()
+	engine := s.engines[req.Project]
+	s.mu.RUnlock()
+	if engine == nil {
+		http.Error(w, fmt.Sprintf("project %q not found", req.Project), http.StatusNotFound)
+		return
+	}
+	outcome, err := engine.DispatchRoutedMessage(req.Platform, &req.Message)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	apiJSON(w, http.StatusOK, InboundMessageResponse{Interaction: outcome})
 }
 
 func (s *APIServer) SocketPath() string {

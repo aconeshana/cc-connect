@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +53,8 @@ var dangerousEnvVars = map[string]bool{
 	"SUDO_COMMAND":          true,
 }
 
+var configEnvNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 func validateRunAsEnv(prefix string, envVars []string) error {
 	for _, v := range envVars {
 		name := strings.TrimSpace(v)
@@ -84,6 +88,10 @@ var configMu sync.Mutex
 var ConfigPath string
 
 type Config struct {
+	// EnvFile optionally loads KEY=VALUE pairs before ${VAR} placeholders are
+	// resolved. Relative paths are anchored to the config file directory.
+	// Existing process environment values always win.
+	EnvFile        string `toml:"env_file,omitempty"`
 	DataDir        string `toml:"data_dir"` // session store directory, default ~/.cc-connect
 	AttachmentSend string `toml:"attachment_send"`
 	// Quiet is legacy: when true and [display] does not set thinking_messages / tool_messages,
@@ -626,6 +634,9 @@ func load(path string) (*Config, error) {
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if err := loadEnvFile(path, cfg.EnvFile); err != nil {
+		return nil, err
+	}
 	resolveEnvInConfig(cfg)
 	if cfg.DataDir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -640,6 +651,49 @@ func load(path string) (*Config, error) {
 	}
 	cfg.ResolveProviderRefs()
 	return cfg, nil
+}
+
+func loadEnvFile(configPath, configured string) error {
+	configured = strings.TrimSpace(resolveEnvPlaceholders(configured))
+	if configured == "" {
+		return nil
+	}
+	envPath := expandUserPath(configured)
+	if !filepath.IsAbs(envPath) {
+		envPath = filepath.Join(filepath.Dir(configPath), envPath)
+	}
+	file, err := os.Open(envPath)
+	if err != nil {
+		return fmt.Errorf("read env_file %s: %w", envPath, err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for lineNumber := 1; scanner.Scan(); lineNumber++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		if !ok || !configEnvNamePattern.MatchString(name) {
+			return fmt.Errorf("parse env_file %s:%d: invalid assignment", envPath, lineNumber)
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') ||
+			(value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = value[1 : len(value)-1]
+		}
+		if _, exists := os.LookupEnv(name); !exists {
+			if err := os.Setenv(name, value); err != nil {
+				return fmt.Errorf("load env_file %s:%d: %w", envPath, lineNumber, err)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read env_file %s: %w", envPath, err)
+	}
+	return nil
 }
 
 // LoadPermissive loads the config file and performs all validation except the
@@ -2158,6 +2212,262 @@ func SaveFeishuPlatformCredentials(opts FeishuCredentialUpdateOptions) (*FeishuC
 		PlatformType:     platform.Type,
 		AllowFrom:        allowFrom,
 	}, nil
+}
+
+// SaveCredentialEnv atomically upserts owner-only dotenv credentials without
+// exposing their values through process arguments or logs.
+func SaveCredentialEnv(path string, values map[string]string) error {
+	path = expandUserPath(strings.TrimSpace(path))
+	if path == "" {
+		return fmt.Errorf("credential env path is required")
+	}
+	if len(values) == 0 {
+		return fmt.Errorf("credential values are required")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create credential directory: %w", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read credential env: %w", err)
+	}
+	lines := []string{}
+	if len(data) > 0 {
+		lines = strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	}
+	keys := make([]string, 0, len(values))
+	for key, value := range values {
+		if !configEnvNamePattern.MatchString(key) {
+			return fmt.Errorf("invalid credential env key %q", key)
+		}
+		if _, err := quoteCredentialEnvValue(value); err != nil {
+			return fmt.Errorf("credential env %s: %w", key, err)
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		quoted, _ := quoteCredentialEnvValue(values[key])
+		replacement := key + "=" + quoted
+		replaced := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
+			name, _, ok := strings.Cut(trimmed, "=")
+			if ok && strings.TrimSpace(name) == key {
+				lines[i] = replacement
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			lines = append(lines, replacement)
+		}
+	}
+	tmp, err := os.CreateTemp(dir, ".credentials-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create credential temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return fmt.Errorf("secure credential temp file: %w", err)
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if _, err := tmp.WriteString(content); err != nil {
+		cleanup()
+		return fmt.Errorf("write credential env: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("sync credential env: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close credential env: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("replace credential env: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure credential env: %w", err)
+	}
+	return nil
+}
+
+// SaveEnvFilePath atomically points the active config at an external dotenv
+// file. It deliberately stores only the path, never credential values.
+func SaveEnvFilePath(path string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	path = expandUserPath(strings.TrimSpace(path))
+	if path == "" {
+		return fmt.Errorf("env file path is required")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	lines, hadTrailing := splitConfigLines(string(data))
+	firstTable := len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			firstTable = i
+			break
+		}
+	}
+	lines = upsertTomlStringKey(lines, 0, firstTable-1, "env_file", path)
+	return writeRawConfig(joinConfigLines(lines, hadTrailing))
+}
+
+func quoteCredentialEnvValue(value string) (string, error) {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return "", fmt.Errorf("value contains a forbidden control character")
+	}
+	if value != "" && strings.IndexFunc(value, func(r rune) bool {
+		return !(r == '_' || r == '-' || r == '.' || r == '/' || r == ':' || r == '@' ||
+			r == '%' || r == '+' || r == '=' || r == ',' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	}) < 0 {
+		return value, nil
+	}
+	if !strings.Contains(value, "'") {
+		return "'" + value + "'", nil
+	}
+	if !strings.Contains(value, `"`) {
+		return `"` + value + `"`, nil
+	}
+	return "", fmt.Errorf("value cannot be represented safely in dotenv format")
+}
+
+type SessionHostFeishuTargetOptions struct {
+	ProjectName string
+	SessionKey  string
+	ChatID      string
+	UserID      string
+}
+
+// SaveSessionHostFeishuTarget completes the application-owned collaboration
+// configuration after the user selects a Feishu chat by messaging the bot.
+func SaveSessionHostFeishuTarget(opts SessionHostFeishuTargetOptions) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	projectName := strings.TrimSpace(opts.ProjectName)
+	sessionKey := strings.TrimSpace(opts.SessionKey)
+	chatID := strings.TrimSpace(opts.ChatID)
+	userID := strings.TrimSpace(opts.UserID)
+	parts := strings.SplitN(sessionKey, ":", 3)
+	if projectName == "" || len(parts) != 3 || chatID == "" || userID == "" ||
+		parts[1] != chatID || parts[2] != userID ||
+		(parts[0] != "feishu" && parts[0] != "lark") {
+		return fmt.Errorf("invalid Session Host Feishu target")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	projectIdx := -1
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == projectName {
+			projectIdx = i
+			break
+		}
+	}
+	if projectIdx < 0 {
+		return fmt.Errorf("project %q not found", projectName)
+	}
+	if strings.TrimSpace(cfg.Projects[projectIdx].Agent.Type) != "sessionhost" {
+		return fmt.Errorf("project %q must use the sessionhost agent", projectName)
+	}
+	platformIdx := -1
+	for i, platform := range cfg.Projects[projectIdx].Platforms {
+		if strings.EqualFold(strings.TrimSpace(platform.Type), parts[0]) {
+			platformIdx = i
+			break
+		}
+	}
+	if platformIdx < 0 {
+		return fmt.Errorf("project %q has no %s platform", projectName, parts[0])
+	}
+
+	lines, hadTrailing := splitConfigLines(string(data))
+	spans := buildRawProjectSpans(lines)
+	if projectIdx >= len(spans) {
+		return fmt.Errorf("project %q located in parsed config but not raw file", projectName)
+	}
+	projSpan := spans[projectIdx]
+	if projSpan.agentOptionsStart < 0 {
+		return fmt.Errorf("project %q has no [projects.agent.options] section", projectName)
+	}
+	lines = upsertTomlStringKey(lines, projSpan.agentOptionsStart+1,
+		projSpan.agentOptionsEnd, "bind_session_key", sessionKey)
+	spans = buildRawProjectSpans(lines)
+	projSpan = spans[projectIdx]
+	collaborationHeader := "[projects.agent.options.collaboration_targets]"
+	collaborationStart, collaborationEnd := findHeaderWithin(lines, projSpan.start, projSpan.end, collaborationHeader)
+	if collaborationStart < 0 {
+		insertAt := projSpan.agentOptionsEnd + 1
+		lines = insertLines(lines, insertAt, []string{"", collaborationHeader,
+			fmt.Sprintf("%s = %s", parts[0], quoteTomlString(sessionKey))})
+	} else {
+		lines = upsertTomlStringKey(lines, collaborationStart+1, collaborationEnd,
+			parts[0], sessionKey)
+	}
+	spans = buildRawProjectSpans(lines)
+	platformSpan := spans[projectIdx].platforms[platformIdx]
+	if platformSpan.optionsStart < 0 {
+		return fmt.Errorf("%s platform has no options section", parts[0])
+	}
+	for key, value := range map[string]string{
+		"allow_from": userID, "allow_chat": chatID, "progress_style": "card",
+	} {
+		lines = upsertTomlStringKey(lines, platformSpan.optionsStart+1,
+			platformSpan.optionsEnd, key, value)
+		spans = buildRawProjectSpans(lines)
+		platformSpan = spans[projectIdx].platforms[platformIdx]
+	}
+	for key, value := range map[string]bool{
+		"thread_isolation": true, "enable_feishu_card": true,
+		"group_reply_all": false, "share_session_in_channel": false,
+	} {
+		lines = upsertTomlRawKey(lines, platformSpan.optionsStart+1,
+			platformSpan.optionsEnd, key, fmt.Sprintf("%t", value))
+		spans = buildRawProjectSpans(lines)
+		platformSpan = spans[projectIdx].platforms[platformIdx]
+	}
+	return writeRawConfig(joinConfigLines(lines, hadTrailing))
+}
+
+func findHeaderWithin(lines []string, start, end int, header string) (int, int) {
+	for i := start; i <= end && i < len(lines); i++ {
+		if !matchTableHeader(lines[i], header) {
+			continue
+		}
+		sectionEnd := end
+		for j := i + 1; j <= end && j < len(lines); j++ {
+			if isAnyTableHeader(lines[j]) {
+				sectionEnd = j - 1
+				break
+			}
+		}
+		return i, sectionEnd
+	}
+	return -1, -1
 }
 
 func stringOption(v any) string {

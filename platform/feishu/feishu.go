@@ -3,6 +3,8 @@ package feishu
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -108,6 +112,7 @@ func init() {
 
 type replyContext struct {
 	messageID  string
+	threadID   string
 	chatID     string
 	sessionKey string
 }
@@ -168,6 +173,13 @@ type Platform struct {
 	// without requiring another @bot mention. Value is the last-seen time so
 	// stale entries can be expired by a future TTL sweep if needed.
 	activeThreadSessions sync.Map // sessionKey -> time.Time
+	// hostThreadSessions are roots created by Session Host. Unlike ordinary
+	// @bot-established threads, every text reply belongs to the bound coding
+	// session and does not require repeating the mention.
+	hostThreadSessions  sync.Map // sessionKey -> time.Time
+	hostThreadStoreMu   sync.Mutex
+	hostThreadStorePath string
+	sessionHostDataDir  string
 
 	richCardImageMu         sync.Mutex
 	richCardImageResolved   map[string]string
@@ -341,10 +353,15 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		}
 	}
 
-	progressStyle := "legacy"
+	// Feishu supports editable structured cards, so aggregate progress into one
+	// in-place card by default. Existing deployments can still opt back into the
+	// historical multi-message stream with progress_style = "legacy".
+	progressStyle := "card"
 	if v, ok := opts["progress_style"].(string); ok {
 		switch strings.ToLower(strings.TrimSpace(v)) {
-		case "", "legacy":
+		case "":
+			progressStyle = "card"
+		case "legacy":
 			progressStyle = "legacy"
 		case "compact", "card":
 			progressStyle = strings.ToLower(strings.TrimSpace(v))
@@ -414,6 +431,11 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		imageBatch:                 make(map[string]*imageBatchEntry),
 		imageBatchWindow:           imageBatchWindow,
 	}
+	dataDir, _ := opts["cc_data_dir"].(string)
+	project, _ := opts["cc_project"].(string)
+	base.sessionHostDataDir = dataDir
+	base.hostThreadStorePath = sessionHostThreadStorePath(dataDir, project, name)
+	base.loadHostThreadSessions()
 	if !useInteractiveCard {
 		base.self = base
 		return base, nil
@@ -703,6 +725,14 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	if chatID == "" {
 		chatID = userID
 	}
+	if !core.AllowList(p.allowFrom, userID) {
+		slog.Warn(p.tag()+": rejected unauthorized card action",
+			"user", userID, "chat_id", chatID, "action", actionVal)
+		// Shared Feishu WebSocket groups fan out one callback across projects.
+		// Return nil so an unauthorized sibling cannot consume a card action
+		// that belongs to a later sibling where the same operator is allowed.
+		return nil, nil
+	}
 	sessionKey := p.sessionKeyFromCardAction(chatID, userID, event.Event.Action.Value)
 
 	// nav: / act: — synchronous card update
@@ -734,6 +764,11 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			select {
 			case card := <-done:
 				if card != nil {
+					if card.HasNoteTag(core.ResumeCardOwnerUpdatedTag) {
+						return &callback.CardActionTriggerResponse{
+							Toast: &callback.Toast{Type: "success", Content: "Updated"},
+						}, nil
+					}
 					return &callback.CardActionTriggerResponse{
 						Card: &callback.Card{
 							Type: "raw",
@@ -744,7 +779,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			case <-time.After(cardNavTimeout):
 				go func() {
 					card := <-done
-					if card == nil {
+					if card == nil || card.HasNoteTag(core.ResumeCardOwnerUpdatedTag) {
 						return
 					}
 					if refresher, ok := p.self.(core.CardRefresher); ok {
@@ -771,29 +806,55 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 
 	// perm: — permission response with in-place card update
 	if strings.HasPrefix(actionVal, "perm:") {
+		requestID, decision, ok := core.ParsePermissionAction(actionVal)
+		if !ok {
+			return nil, nil
+		}
 		var responseText string
-		switch actionVal {
-		case "perm:allow":
+		switch decision {
+		case "allow":
 			responseText = "allow"
-		case "perm:deny":
+		case "deny":
 			responseText = "deny"
-		case "perm:allow_all":
+		case "allow_all":
 			responseText = "allow all"
 		default:
 			return nil, nil
 		}
 
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+		result := make(chan core.InteractionOutcome, 1)
 		go p.dispatchCoreMessage(&core.Message{
-			SessionKey:           sessionKey,
-			Platform:             p.platformName,
-			UserID:               userID,
-			UserName:             p.resolveUserName(userID),
-			ChatName:             p.resolveChatName(chatID),
-			Content:              responseText,
-			ReplyCtx:             rctx,
-			IsPermissionResponse: true,
+			SessionKey:            sessionKey,
+			Platform:              p.platformName,
+			UserID:                userID,
+			UserName:              p.resolveUserName(userID),
+			ChatName:              p.resolveChatName(chatID),
+			Content:               responseText,
+			ReplyCtx:              rctx,
+			IsPermissionResponse:  true,
+			IsInteractionResponse: true,
+			InteractionRequestID:  requestID,
+			InteractionResult:     result,
 		})
+
+		var outcome core.InteractionOutcome
+		select {
+		case outcome = <-result:
+		case <-time.After(8 * time.Second):
+			return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+				Type: "warning", Content: "终端确认超时，请重试（Terminal confirmation timed out）",
+			}}, nil
+		}
+		if !outcome.Accepted {
+			content := "该请求已失效或属于另一个终端会话（Stale or unavailable terminal request）"
+			if outcome.Error != "" {
+				content = "终端响应失败，请重试（Terminal response failed）"
+			}
+			return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+				Type: "error", Content: content,
+			}}, nil
+		}
 
 		permLabel, _ := event.Event.Action.Value["perm_label"].(string)
 		permColor, _ := event.Event.Action.Value["perm_color"].(string)
@@ -815,16 +876,71 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 
 	// askq: — AskUserQuestion option selected, forward as user message
 	if strings.HasPrefix(actionVal, "askq:") {
+		requestID, _, optionIndex, ok := core.ParseAskQuestionAction(actionVal)
+		if !ok {
+			return nil, nil
+		}
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-		go p.dispatchCoreMessage(&core.Message{
-			SessionKey: sessionKey,
-			Platform:   p.platformName,
-			UserID:     userID,
-			UserName:   p.resolveUserName(userID),
-			ChatName:   p.resolveChatName(chatID),
-			Content:    actionVal,
-			ReplyCtx:   rctx,
-		})
+		msg := &core.Message{
+			SessionKey:            sessionKey,
+			Platform:              p.platformName,
+			UserID:                userID,
+			UserName:              p.resolveUserName(userID),
+			ChatName:              p.resolveChatName(chatID),
+			Content:               actionVal,
+			ReplyCtx:              rctx,
+			IsInteractionResponse: true,
+			InteractionRequestID:  requestID,
+		}
+		if optionIndex == 0 {
+			result := make(chan core.InteractionOutcome, 1)
+			msg.InteractionResult = result
+			go p.dispatchCoreMessage(msg)
+
+			var outcome core.InteractionOutcome
+			select {
+			case outcome = <-result:
+			case <-time.After(8 * time.Second):
+				return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+					Type: "warning", Content: "终端确认超时，请重试（Terminal confirmation timed out）",
+				}}, nil
+			}
+			if !outcome.Accepted {
+				content := "该请求已失效或属于另一个终端会话（Stale or unavailable terminal request）"
+				if outcome.Error != "" {
+					content = "终端响应失败，请重试（Terminal response failed）"
+				}
+				return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+					Type: "error", Content: content,
+				}}, nil
+			}
+
+			customTitle, _ := event.Event.Action.Value["askq_custom_title"].(string)
+			customPrompt, _ := event.Event.Action.Value["askq_custom_prompt"].(string)
+			customNote, _ := event.Event.Action.Value["askq_custom_note"].(string)
+			askqQuestion, _ := event.Event.Action.Value["askq_question"].(string)
+			answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
+			if customTitle == "" {
+				customTitle = answerLabel
+			}
+			cb := core.NewCard().Title(customTitle, "blue")
+			if askqQuestion != "" {
+				cb.Markdown("**" + askqQuestion + "**")
+			}
+			if customPrompt != "" {
+				cb.Markdown(customPrompt)
+			}
+			if customNote != "" {
+				cb.Note(customNote)
+			}
+			return &callback.CardActionTriggerResponse{
+				Card: &callback.Card{
+					Type: "raw",
+					Data: renderCardMap(cb.Build(), sessionKey),
+				},
+			}, nil
+		}
+		go p.dispatchCoreMessage(msg)
 
 		answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
 		askqQuestion, _ := event.Event.Action.Value["askq_question"].(string)
@@ -1367,6 +1483,9 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 			// unrelated chatter.
 			case p.threadIsolation && isAttachmentMsgType(msgType) && p.isActiveThreadSession(sessionKey):
 				slog.Debug(p.tag()+": passing attachment through active thread without mention",
+					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
+			case p.threadIsolation && p.isHostThreadSession(sessionKey):
+				slog.Debug(p.tag()+": passing message through bound host thread without mention",
 					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
 			default:
 				slog.Debug(p.tag()+": ignoring group message without bot mention", "chat_id", chatID)
@@ -3373,13 +3492,20 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 // TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
 // Should revisit thread/root handling without changing thread_isolation=false behavior.
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
-	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
+	if p.threadIsolation && msg != nil {
+		chatType := stringValue(msg.ChatType)
 		rootID := stringValue(msg.RootId)
-		if rootID == "" {
+		// A group root is itself the durable thread anchor. In P2P, only an
+		// explicit RootId means the message is inside a thread; using MessageId
+		// there would turn every direct message into a separate conversation.
+		if rootID == "" && chatType == "group" {
 			rootID = stringValue(msg.MessageId)
 		}
 		if rootID != "" {
-			return fmt.Sprintf("%s:%s:root:%s", p.tag(), chatID, rootID)
+			threadKey := fmt.Sprintf("%s:%s:root:%s", p.tag(), chatID, rootID)
+			if chatType == "group" || p.isHostThreadSession(threadKey) {
+				return threadKey
+			}
 		}
 	}
 	if p.shareSessionInChannel {
@@ -3433,11 +3559,17 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	_, err := p.replyMessageWithID(ctx, rc, msgType, content)
+	return err
+}
+
+func (p *Platform) replyMessageWithID(ctx context.Context, rc replyContext, msgType, content string) (string, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
 		Build()
-	return p.withTransientRetry(ctx, "reply", func() error {
+	var messageID string
+	err := p.withTransientRetry(ctx, "reply", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
 			if err != nil {
@@ -3446,12 +3578,27 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				messageID = *resp.Data.MessageId
+			}
 			return nil
 		})
 	})
+	if err != nil {
+		return "", err
+	}
+	if messageID == "" {
+		return "", fmt.Errorf("%s: reply returned no message ID", p.tag())
+	}
+	return messageID, nil
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+	_, err := p.createMessageWithID(ctx, chatID, msgType, content, op)
+	return err
+}
+
+func (p *Platform) createMessageWithID(ctx context.Context, chatID, msgType, content, op string) (string, error) {
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
@@ -3460,7 +3607,8 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			Content(content).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, op, func() error {
+	var messageID string
+	err := p.withTransientRetry(ctx, op, func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Create(ctx, req, options...)
 			if err != nil {
@@ -3469,9 +3617,19 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			if !resp.Success() {
 				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				messageID = *resp.Data.MessageId
+			}
 			return nil
 		})
 	})
+	if err != nil {
+		return "", err
+	}
+	if messageID == "" {
+		return "", fmt.Errorf("%s: %s returned no message ID", p.tag(), op)
+	}
+	return messageID, nil
 }
 
 func (p *Platform) withFreshTenantAccessTokenRetry(ctx context.Context, operation string, fn feishuRequestFunc) error {
@@ -3641,6 +3799,296 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	return rc, nil
 }
 
+// BindSessionThread creates a visible root message and returns a thread-scoped
+// session key. Subsequent replies use ReplyInThread, while inbound replies to
+// this root resolve to the same key through makeSessionKey.
+func (p *Platform) BindSessionThread(
+	ctx context.Context, baseSessionKey, sessionID, title string,
+) (string, any, error) {
+	if !p.threadIsolation {
+		return "", nil, fmt.Errorf("%s: thread_isolation must be enabled for host session binding", p.tag())
+	}
+	raw, err := p.ReconstructReplyCtx(baseSessionKey)
+	if err != nil {
+		return "", nil, err
+	}
+	base := raw.(replyContext)
+	if base.chatID == "" {
+		return "", nil, fmt.Errorf("%s: host binding target has an empty chat ID", p.tag())
+	}
+	if isThreadSessionKey(baseSessionKey) && base.messageID != "" {
+		if err := p.rememberHostThreadSession(baseSessionKey); err != nil {
+			return "", nil, err
+		}
+		return baseSessionKey, base, nil
+	}
+	return p.createHostSessionThread(ctx, base.chatID, baseSessionKey, sessionID, title)
+}
+
+func (p *Platform) UpdateSessionThreadTitle(
+	ctx context.Context, sessionKey, sessionID, title string,
+) error {
+	raw, err := p.ReconstructReplyCtx(sessionKey)
+	if err != nil {
+		return err
+	}
+	rc := raw.(replyContext)
+	if rc.messageID == "" {
+		return fmt.Errorf("%s: host thread root message ID is empty", p.tag())
+	}
+	content := hostSessionRootContent(title, sessionID)
+	msgType, body := buildReplyContent(content)
+	req := larkim.NewUpdateMessageReqBuilder().
+		MessageId(rc.messageID).
+		Body(larkim.NewUpdateMessageReqBodyBuilder().
+			MsgType(msgType).
+			Content(body).
+			Build()).
+		Build()
+	return p.withTransientRetry(ctx, "update host session thread title", func() error {
+		return p.withFreshTenantAccessTokenRetry(ctx, "update host session thread title", func(
+			client *lark.Client, options ...larkcore.RequestOptionFunc,
+		) error {
+			resp, err := client.Im.Message.Update(ctx, req, options...)
+			if err != nil {
+				return fmt.Errorf("%s: update host session thread title: %w", p.tag(), err)
+			}
+			if !resp.Success() {
+				return fmt.Errorf("%s: update host session thread title failed code=%d msg=%s",
+					p.tag(), resp.Code, resp.Msg)
+			}
+			return nil
+		})
+	})
+}
+
+func (p *Platform) CreateSessionThread(
+	ctx context.Context, baseSessionKey, title string,
+) (string, any, error) {
+	raw, err := p.ReconstructReplyCtx(baseSessionKey)
+	if err != nil {
+		return "", nil, err
+	}
+	base := raw.(replyContext)
+	if base.chatID == "" {
+		return "", nil, fmt.Errorf("%s: host binding target has an empty chat ID", p.tag())
+	}
+	return p.createHostSessionThread(ctx, base.chatID, baseSessionKey, "", title)
+}
+
+func (p *Platform) createHostSessionThread(
+	ctx context.Context, chatID, baseSessionKey, sessionID, title string,
+) (string, any, error) {
+	if !p.threadIsolation {
+		return "", nil, fmt.Errorf("%s: thread_isolation must be enabled for host session binding", p.tag())
+	}
+	if strings.TrimSpace(title) == "" {
+		title = "Claude Code"
+	}
+	content := hostSessionRootContent(title, sessionID)
+	msgType, body := buildReplyContent(content)
+	rootID, err := p.createMessageWithID(ctx, chatID, msgType, body, "bind host session")
+	if err != nil {
+		return "", nil, err
+	}
+	threadID, err := p.openHostSessionThread(ctx, chatID, baseSessionKey, rootID, title)
+	if err != nil {
+		return "", nil, err
+	}
+	key := fmt.Sprintf("%s:%s:root:%s", p.platformName, chatID, rootID)
+	if err := p.rememberHostThreadSession(key); err != nil {
+		return "", nil, err
+	}
+	return key, replyContext{
+		messageID: rootID, threadID: threadID, chatID: chatID, sessionKey: key,
+	}, nil
+}
+
+func hostSessionRootContent(title, sessionID string) string {
+	content := "🧵 " + strings.TrimSpace(title)
+	if short := shortVisibleSessionID(sessionID); short != "" {
+		content += fmt.Sprintf("\n\nSession · `%s`", short)
+	}
+	return content
+}
+
+func shortVisibleSessionID(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if len(sessionID) <= 8 {
+		return sessionID
+	}
+	return sessionID[:8]
+}
+
+// openHostSessionThread eagerly turns the newly-created root into a native
+// Feishu thread. Waiting for the first progress card to reply eventually
+// creates the same thread, but a locally-started Session Host has no inbound
+// Feishu participant. Sending this bootstrap reply immediately makes the
+// presentation available as a real sub-conversation before agent output
+// begins. When the binding identifies one explicit user, mention them so
+// Feishu passively subscribes that user to the new topic.
+func (p *Platform) openHostSessionThread(
+	ctx context.Context, chatID, baseSessionKey, rootID, title string,
+) (string, error) {
+	content := strings.TrimSpace(title)
+	if content == "" {
+		content = "Claude Code"
+	}
+	if ownerID, ok := p.hostThreadOwnerID(baseSessionKey); ok {
+		name := html.EscapeString(p.resolveUserName(ownerID))
+		content = fmt.Sprintf(`<at user_id="%s">%s</at> %s`, ownerID, name, content)
+	}
+	msgType, body := buildReplyContent(content)
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(rootID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType(msgType).
+			Content(body).
+			ReplyInThread(true).
+			Build()).
+		Build()
+	var threadID string
+	err := p.withTransientRetry(ctx, "open host session thread", func() error {
+		return p.withFreshTenantAccessTokenRetry(ctx, "open host session thread", func(
+			client *lark.Client, options ...larkcore.RequestOptionFunc,
+		) error {
+			resp, err := client.Im.Message.Reply(ctx, req, options...)
+			if err != nil {
+				return fmt.Errorf("%s: open host session thread API call: %w", p.tag(), err)
+			}
+			if !resp.Success() {
+				return fmt.Errorf("%s: open host session thread failed code=%d msg=%s",
+					p.tag(), resp.Code, resp.Msg)
+			}
+			if resp.Data != nil && resp.Data.ThreadId != nil {
+				threadID = strings.TrimSpace(*resp.Data.ThreadId)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return "", err
+	}
+	if threadID == "" {
+		return "", fmt.Errorf("%s: open host session thread returned no thread ID", p.tag())
+	}
+	return threadID, nil
+}
+
+func (p *Platform) hostThreadOwnerID(baseSessionKey string) (string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(baseSessionKey), ":", 3)
+	if len(parts) == 3 && parts[0] == p.platformName &&
+		strings.HasPrefix(strings.ToLower(parts[2]), "ou_") &&
+		isValidFeishuLookupID(parts[2]) {
+		return parts[2], true
+	}
+	allowFrom := strings.TrimSpace(p.allowFrom)
+	if allowFrom == "" || allowFrom == "*" || strings.Contains(allowFrom, ",") {
+		return "", false
+	}
+	if !strings.HasPrefix(strings.ToLower(allowFrom), "ou_") || !isValidFeishuLookupID(allowFrom) {
+		return "", false
+	}
+	return allowFrom, true
+}
+
+func sessionHostThreadStorePath(dataDir, project, platformName string) string {
+	dataDir = strings.TrimSpace(dataDir)
+	project = strings.TrimSpace(project)
+	if dataDir == "" || project == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(project))
+	fileName := platformName + "-" + hex.EncodeToString(digest[:8]) + ".json"
+	return filepath.Join(dataDir, "session-host", "threads", fileName)
+}
+
+func (p *Platform) rememberHostThreadSession(sessionKey string) error {
+	if !p.threadIsolation || !isThreadSessionKey(sessionKey) {
+		return fmt.Errorf("%s: invalid host thread session key %q", p.tag(), sessionKey)
+	}
+	p.markThreadSessionActive(sessionKey)
+	p.hostThreadSessions.Store(sessionKey, time.Now())
+	if p.hostThreadStorePath == "" {
+		return nil
+	}
+	return p.saveHostThreadSessions()
+}
+
+func (p *Platform) loadHostThreadSessions() {
+	if p.hostThreadStorePath == "" {
+		return
+	}
+	data, err := os.ReadFile(p.hostThreadStorePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn(p.tag()+": failed to load host thread bindings", "error", err)
+		}
+		return
+	}
+	var stored map[string]time.Time
+	if err := json.Unmarshal(data, &stored); err != nil {
+		slog.Warn(p.tag()+": failed to decode host thread bindings", "error", err)
+		return
+	}
+	for sessionKey, lastSeen := range stored {
+		if !strings.HasPrefix(sessionKey, p.platformName+":") || !isThreadSessionKey(sessionKey) {
+			continue
+		}
+		p.hostThreadSessions.Store(sessionKey, lastSeen)
+		p.markThreadSessionActive(sessionKey)
+	}
+}
+
+func (p *Platform) saveHostThreadSessions() error {
+	p.hostThreadStoreMu.Lock()
+	defer p.hostThreadStoreMu.Unlock()
+	stored := make(map[string]time.Time)
+	if data, err := os.ReadFile(p.hostThreadStorePath); err == nil {
+		if err := json.Unmarshal(data, &stored); err != nil {
+			return fmt.Errorf("%s: decode existing host thread bindings: %w", p.tag(), err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("%s: read existing host thread bindings: %w", p.tag(), err)
+	}
+	p.hostThreadSessions.Range(func(key, value any) bool {
+		sessionKey, keyOK := key.(string)
+		lastSeen, valueOK := value.(time.Time)
+		if keyOK && valueOK && strings.HasPrefix(sessionKey, p.platformName+":") && isThreadSessionKey(sessionKey) {
+			stored[sessionKey] = lastSeen
+		}
+		return true
+	})
+	data, err := json.MarshalIndent(stored, "", "  ")
+	if err != nil {
+		return fmt.Errorf("%s: encode host thread bindings: %w", p.tag(), err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p.hostThreadStorePath), 0700); err != nil {
+		return fmt.Errorf("%s: create host thread binding directory: %w", p.tag(), err)
+	}
+	if err := core.AtomicWriteFile(p.hostThreadStorePath, data, 0600); err != nil {
+		return fmt.Errorf("%s: save host thread bindings: %w", p.tag(), err)
+	}
+	return nil
+}
+
+func (p *Platform) isHostThreadSession(sessionKey string) bool {
+	if !p.threadIsolation || !isThreadSessionKey(sessionKey) {
+		return false
+	}
+	if _, ok := p.hostThreadSessions.Load(sessionKey); ok {
+		return true
+	}
+	// Another cc-connect process may have created this Session Host thread
+	// after this platform started. Refresh on miss so P2P replies keep their
+	// root-scoped key and can be routed to the owning terminal instance.
+	p.loadHostThreadSessions()
+	if _, ok := p.hostThreadSessions.Load(sessionKey); ok {
+		return true
+	}
+	return core.SessionHostRouteExists(p.sessionHostDataDir, sessionKey)
+}
+
 // RelayGroupVisibilityKey implements core.RelayGroupVisibilityTarget for
 // feishu.  When the caller session key targets a feishu thread (its
 // third colon-separated segment carries a non-empty "root:" or
@@ -3763,11 +4211,6 @@ func buildCardJSONWithStatusFooter(content, footer string) string {
 	return string(b)
 }
 
-func isZhLikeProgressLang(lang string) bool {
-	l := strings.ToLower(strings.TrimSpace(lang))
-	return strings.HasPrefix(l, "zh")
-}
-
 func progressAgentLabel(agent string) string {
 	agent = strings.TrimSpace(agent)
 	if agent == "" {
@@ -3777,53 +4220,27 @@ func progressAgentLabel(agent string) string {
 }
 
 func progressStateMeta(state core.ProgressCardState, lang string, agent string) (title string, template string, footer string) {
-	zh := isZhLikeProgressLang(lang)
 	switch state {
 	case core.ProgressCardStateCompleted:
-		if zh {
-			return fmt.Sprintf("%s · 已完成", agent), "green", "本过程卡片已停止更新，完整答复见下一条消息。"
-		}
 		return fmt.Sprintf("%s · Completed", agent), "green", "This progress card is no longer updating. Full response is in the next message."
 	case core.ProgressCardStateFailed:
-		if zh {
-			return fmt.Sprintf("%s · 失败", agent), "red", "本过程卡片已停止更新（失败），完整错误说明见下一条消息。"
-		}
 		return fmt.Sprintf("%s · Failed", agent), "red", "This progress card has stopped (failed). See the next message for details."
 	default:
-		if zh {
-			return fmt.Sprintf("%s · 进行中", agent), "blue", ""
-		}
 		return fmt.Sprintf("%s · Running", agent), "blue", ""
 	}
 }
 
 func progressKindLabel(kind core.ProgressCardEntryKind, lang string) string {
-	zh := isZhLikeProgressLang(lang)
 	switch kind {
 	case core.ProgressEntryThinking:
-		if zh {
-			return "思考"
-		}
 		return "Thinking"
 	case core.ProgressEntryToolUse:
-		if zh {
-			return "工具调用"
-		}
 		return "Tool"
 	case core.ProgressEntryToolResult:
-		if zh {
-			return "工具结果"
-		}
 		return "Result"
 	case core.ProgressEntryError:
-		if zh {
-			return "错误"
-		}
 		return "Error"
 	default:
-		if zh {
-			return "更新"
-		}
 		return "Update"
 	}
 }
@@ -3979,9 +4396,6 @@ func formatProgressToolResult(text string) string {
 }
 
 func progressNoOutputText(lang string) string {
-	if isZhLikeProgressLang(lang) {
-		return "无输出"
-	}
 	return "No output"
 }
 
@@ -4094,16 +4508,6 @@ func splitProgressItemsByLane(items []core.ProgressCardEntry) (reasoning []core.
 }
 
 func progressPanelTitle(label string, count int, lang string) string {
-	if isZhLikeProgressLang(lang) {
-		switch label {
-		case "Reasoning":
-			label = "思考"
-		case "Tools":
-			label = "工具"
-		case "Updates":
-			label = "更新"
-		}
-	}
 	if count > 0 {
 		return fmt.Sprintf("%s (%d)", label, count)
 	}
@@ -4166,15 +4570,16 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	}
 
 	agent := progressAgentLabel(payload.Agent)
-	title, template, footer := progressStateMeta(payload.State, payload.Lang, agent)
+	identity := strings.TrimSpace(payload.Title)
+	if identity == "" {
+		identity = agent
+	}
+	title, template, footer := progressStateMeta(payload.State, payload.Lang, identity)
 	running := payload.State == core.ProgressCardStateRunning
 
 	elements := make([]map[string]any, 0, len(items)+3)
 	if payload.Truncated {
 		truncatedText := "Showing latest updates only."
-		if isZhLikeProgressLang(payload.Lang) {
-			truncatedText = "仅显示最近更新。"
-		}
 		elements = append(elements, map[string]any{
 			"tag": "div",
 			"text": map[string]any{
@@ -6253,8 +6658,8 @@ const maxRichCardJSONBytes = 28000
 // buildRichCard renders a Card 2.0 "single-card" turn with collapsible
 // reasoning/tool panels, streaming markdown body, status-colored header, and a
 // pre-composed multi-line statusFooter (engine-owned, includes elapsed).
-func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
-	b, err := buildRichCardJSONBytes(status, steps, markdown, streaming, statusFooter)
+func buildRichCard(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
+	b, err := buildRichCardJSONBytes(status, title, steps, markdown, streaming, statusFooter)
 	if err != nil {
 		slog.Debug("feishu: build rich card marshal failed, fallback to basic card", "error", err)
 		return buildCardJSONWithStatus(markdown, status)
@@ -6276,7 +6681,7 @@ func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, mark
 		{perLane: 3, textLen: 80},
 	} {
 		compactSteps := compactRichStepsForCardSize(steps, limit.perLane, limit.textLen)
-		compact, err := buildRichCardJSONBytes(status, compactSteps, markdown, streaming, statusFooter)
+		compact, err := buildRichCardJSONBytes(status, title, compactSteps, markdown, streaming, statusFooter)
 		if err == nil && len(compact) <= maxRichCardJSONBytes {
 			slog.Debug("feishu: rich card exceeded size limit, compacted panels",
 				"original_size", len(b),
@@ -6296,7 +6701,7 @@ func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, mark
 	return buildCardJSONWithStatus(fallbackMarkdown, status)
 }
 
-func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) ([]byte, error) {
+func buildRichCardJSONBytes(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) ([]byte, error) {
 	reasoningSteps, toolSteps := splitRichStepsByLane(steps)
 	panelMaps := make([]map[string]any, 0, 2)
 	if len(reasoningSteps) > 0 {
@@ -6368,6 +6773,9 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 	case core.CardStatusThinking, core.CardStatusWorking:
 		headerTemplate = "blue"
 		headerTitle = pickThinkingVerb()
+	}
+	if title = strings.TrimSpace(title); title != "" {
+		headerTitle = title + " · " + headerTitle
 	}
 
 	card := map[string]any{

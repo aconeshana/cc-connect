@@ -22,8 +22,8 @@ type Platform struct {
 	project string
 	token   string
 
-	transportKind string
-	allowFrom     string
+	transportKind  string
+	allowFrom      string
 	shareInChannel bool
 	groupReplyAll  bool
 
@@ -350,22 +350,30 @@ func (p *Platform) handleCardAction(raw []byte) {
 	rc := replyContext{SessionKey: ca.SessionKey, ReplyCtx: replyCtx}
 
 	if strings.HasPrefix(ca.Action, "perm:") {
+		requestID, decision, ok := core.ParsePermissionAction(ca.Action)
+		if !ok {
+			return
+		}
 		var responseText string
-		switch ca.Action {
-		case "perm:allow":
+		switch decision {
+		case "allow":
 			responseText = "allow"
-		case "perm:deny":
+		case "deny":
 			responseText = "deny"
-		case "perm:allow_all":
+		case "allow_all":
 			responseText = "allow all"
 		default:
 			return
 		}
-		p.dispatchAsPermissionResponse(ca.SessionKey, rc, responseText)
+		p.dispatchAsPermissionResponse(ca.SessionKey, rc, responseText, requestID)
 		return
 	}
 	if strings.HasPrefix(ca.Action, "askq:") {
-		p.dispatchAsMessage(ca.SessionKey, rc, ca.Action)
+		requestID, _, _, ok := core.ParseAskQuestionAction(ca.Action)
+		if !ok {
+			return
+		}
+		p.dispatchAsInteractionResponse(ca.SessionKey, rc, ca.Action, requestID)
 		return
 	}
 	if strings.HasPrefix(ca.Action, "cmd:") {
@@ -443,7 +451,8 @@ func (p *Platform) dispatchAsMessage(sessionKey string, rc replyContext, content
 // stale clicks (e.g. tapping an old "Allow" card after the session reset)
 // instead of letting the literal "allow"/"deny" string reach the agent
 // prompt stream. Mirrors the feishu/qqbot/telegram/bridge convention.
-func (p *Platform) dispatchAsPermissionResponse(sessionKey string, rc replyContext, content string) {
+func (p *Platform) dispatchAsPermissionResponse(sessionKey string, rc replyContext, content,
+	requestID string) {
 	p.mu.RLock()
 	h := p.handler
 	p.mu.RUnlock()
@@ -451,15 +460,32 @@ func (p *Platform) dispatchAsPermissionResponse(sessionKey string, rc replyConte
 		return
 	}
 	msg := &core.Message{
-		SessionKey:           sessionKey,
-		Platform:             p.name,
-		UserID:               "system",
-		UserName:             "System",
-		Content:              content,
-		ReplyCtx:             rc,
-		IsPermissionResponse: true,
+		SessionKey:            sessionKey,
+		Platform:              p.name,
+		UserID:                "system",
+		UserName:              "System",
+		Content:               content,
+		ReplyCtx:              rc,
+		IsPermissionResponse:  true,
+		IsInteractionResponse: true,
+		InteractionRequestID:  requestID,
 	}
 	go h(p, msg)
+}
+
+func (p *Platform) dispatchAsInteractionResponse(sessionKey string, rc replyContext, content,
+	requestID string) {
+	p.mu.RLock()
+	h := p.handler
+	p.mu.RUnlock()
+	if h == nil {
+		return
+	}
+	go h(p, &core.Message{
+		SessionKey: sessionKey, Platform: p.name, UserID: "system", UserName: "System",
+		Content: content, ReplyCtx: rc, IsInteractionResponse: true,
+		InteractionRequestID: requestID,
+	})
 }
 
 func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) error {

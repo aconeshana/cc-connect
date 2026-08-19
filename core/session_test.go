@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -175,6 +176,78 @@ func TestSessionManager_GetOrCreateActive_Persists(t *testing.T) {
 	}
 	if list[0].ID != s.ID {
 		t.Errorf("reloaded session ID = %q, want %q", list[0].ID, s.ID)
+	}
+}
+
+func TestSessionManager_SharedStoreConcurrentCreatesDoNotLoseUpdatesOrReuseIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	first := NewSessionManager(path)
+	second := NewSessionManager(path)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			first.NewSession(fmt.Sprintf("first-%d", i), "first")
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			second.NewSession(fmt.Sprintf("second-%d", i), "second")
+		}(i)
+	}
+	wg.Wait()
+
+	reloaded := NewSessionManager(path)
+	all := reloaded.AllSessions()
+	if len(all) != 40 {
+		t.Fatalf("persisted sessions = %d, want 40", len(all))
+	}
+	seen := make(map[string]bool, len(all))
+	for _, session := range all {
+		if seen[session.ID] {
+			t.Fatalf("duplicate internal session ID %q", session.ID)
+		}
+		seen[session.ID] = true
+	}
+}
+
+func TestSessionManager_SharedStoreConcurrentHistoryAppendsDoNotLoseUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	seed := NewSessionManager(path)
+	seed.GetOrCreateActive("shared").AddHistory("user", "baseline")
+	seed.Save()
+
+	first := NewSessionManager(path)
+	second := NewSessionManager(path)
+	first.GetOrCreateActive("shared").AddHistory("assistant", "from-first")
+	second.GetOrCreateActive("shared").AddHistory("assistant", "from-second")
+	first.Save()
+	second.Save()
+
+	history := NewSessionManager(path).GetOrCreateActive("shared").GetHistory(0)
+	contents := make(map[string]bool, len(history))
+	for _, entry := range history {
+		contents[entry.Content] = true
+	}
+	for _, want := range []string{"baseline", "from-first", "from-second"} {
+		if !contents[want] {
+			t.Fatalf("merged history = %#v, missing %q", history, want)
+		}
+	}
+}
+
+func TestSessionManager_AgentSessionIDHasOneDeterministicThread(t *testing.T) {
+	sm := NewSessionManager("")
+	first := sm.SwitchToAgentSession("feishu:chat:root:first", "agent-42", "sessionhost", "first")
+	second := sm.SwitchToAgentSession("feishu:chat:root:second", "agent-42", "sessionhost", "second")
+
+	if first != second {
+		t.Fatal("same AgentSessionID created two internal sessions")
+	}
+	key, ok := sm.SessionKeyForAgentSessionID("agent-42")
+	if !ok || key != "feishu:chat:root:second" {
+		t.Fatalf("AgentSessionID mapping = %q, %v, want second thread", key, ok)
 	}
 }
 
@@ -1117,4 +1190,3 @@ func TestKnownAgentSessionIDs_ResetAllSessionsBug(t *testing.T) {
 		t.Fatalf("filterOwnedSessions returned %d, want 3", len(filtered))
 	}
 }
-

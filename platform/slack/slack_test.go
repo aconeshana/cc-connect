@@ -1,13 +1,99 @@
 package slack
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/chenhg5/cc-connect/core"
+	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
+
+func TestPlatformImplementsSessionThreadBinder(t *testing.T) {
+	var platform any = &Platform{}
+	if _, ok := platform.(core.SessionThreadBinder); !ok {
+		t.Fatal("slack should expose native thread binding to Session Host")
+	}
+	if _, ok := platform.(core.FreshSessionThreadBinder); !ok {
+		t.Fatal("slack should expose fresh native thread creation to Session Host")
+	}
+}
+
+func TestCreateSessionThreadFromExistingThreadCreatesSiblingRoot(t *testing.T) {
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "channel": "C1", "ts": "1700000000.0002",
+		})
+	}))
+	defer srv.Close()
+	p := &Platform{client: slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))}
+
+	key, _, err := p.CreateSessionThread(
+		context.Background(), "slack:C1:t:1700000000.0001", "Sibling")
+	if err != nil {
+		t.Fatalf("CreateSessionThread: %v", err)
+	}
+	if key != "slack:C1:t:1700000000.0002" || posts != 1 {
+		t.Fatalf("key=%q posts=%d", key, posts)
+	}
+}
+
+func TestBindSessionThreadCreatesProactiveRoot(t *testing.T) {
+	var postedText string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat.postMessage" {
+			t.Fatalf("unexpected Slack API path %q", r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm: %v", err)
+		}
+		postedText = r.FormValue("text")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "channel": "C1", "ts": "1700000000.0001",
+		})
+	}))
+	defer srv.Close()
+	p := &Platform{client: slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))}
+
+	key, rawCtx, err := p.BindSessionThread(
+		context.Background(), "slack:C1:U1", "session-1", "Build gateway")
+	if err != nil {
+		t.Fatalf("BindSessionThread: %v", err)
+	}
+	if key != "slack:C1:t:1700000000.0001" {
+		t.Fatalf("session key = %q", key)
+	}
+	rc := rawCtx.(replyContext)
+	if rc.channel != "C1" || rc.timestamp != "1700000000.0001" {
+		t.Fatalf("reply context = %#v", rc)
+	}
+	if postedText != "Build gateway" {
+		t.Fatalf("posted root = %q", postedText)
+	}
+}
+
+func TestBindSessionThreadRestoresExistingThreadWithoutPosting(t *testing.T) {
+	p := &Platform{}
+	key, rawCtx, err := p.BindSessionThread(
+		context.Background(), "slack:C1:t:1700000000.0001", "session-1", "ignored")
+	if err != nil {
+		t.Fatalf("BindSessionThread: %v", err)
+	}
+	if key != "slack:C1:t:1700000000.0001" {
+		t.Fatalf("session key = %q", key)
+	}
+	rc := rawCtx.(replyContext)
+	if rc.timestamp != "1700000000.0001" {
+		t.Fatalf("reply context = %#v", rc)
+	}
+}
 
 func TestStripAppMentionText(t *testing.T) {
 	tests := []struct {

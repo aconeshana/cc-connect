@@ -804,6 +804,25 @@ name = "my-backend"
 #   - check background tasks
 #   - continue unfinished work
 
+# Session Host connects to an application-owned semantic session runtime.
+# It does not start a CLI subprocess or parse PTY-rendered terminal output.
+# The host owns the model session and mirrors the same semantic events to both
+# its local terminal UI and cc-connect/IM platforms.
+#
+# [projects.agent]
+# type = "sessionhost"
+#
+# [projects.agent.options]
+# endpoint = "unix:///path/to/session-link.sock" # optional when launched by the Java JAR
+# auth_token_env = "CC_SESSION_LINK_TOKEN" # token value is read from the environment
+# work_dir = "/path/to/backend" # optional when launched by the Java JAR
+# bind_session_key = "feishu:oc_chat_id:ou_owner" # legacy single picker target; default is still Off
+# [projects.agent.options.collaboration_targets]
+# feishu = "feishu:oc_chat_id:ou_owner"
+# slack = "slack:C0123456789:U0123456789"
+# request_timeout_seconds = 30
+# max_frame_bytes = 16777216
+
 [projects.agent]
 type = "claudecode"
 
@@ -1025,8 +1044,8 @@ app_secret = "your-feishu-app-secret"
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
-# progress_style = "legacy" # Progress rendering style: legacy | compact | card
-#                           # 进度消息展示风格：legacy（逐条消息）| compact（单消息持续更新）| card（结构化卡片）
+# progress_style = "card"   # Progress rendering style: card (default) | compact | legacy
+#                           # 进度消息展示风格：card（默认，结构化单卡）| compact（纯文本单消息）| legacy（逐条消息）
 # resolve_mentions = false  # Auto-resolve @name in outgoing messages to Feishu at tags by matching group member names
 #                           # 自动将发出消息中的 @显示名 替换为飞书 at 标签（通过匹配群成员名称）
 # mention_map = { BOT-A = "ou_bot_a_open_id", BOT-B = "ou_bot_b_open_id" }

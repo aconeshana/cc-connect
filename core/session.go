@@ -18,21 +18,25 @@ const ContinueSession = "__continue__"
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
 	// `/provider switch` (the agent_session_id survives on disk while the
 	// in-memory active provider does not). Empty means "no explicit choice
 	// — use whatever the agent's default is".
-	ActiveProvider string         `json:"active_provider,omitempty"`
-	History        []HistoryEntry `json:"history"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	ActiveProvider string `json:"active_provider,omitempty"`
+	// CollaborationChannel persists the one IM surface explicitly selected for
+	// this host-owned session. nil denotes a legacy snapshot written before this
+	// field existed; a pointer to "" is an explicit opt-out.
+	CollaborationChannel *string        `json:"collaboration_channel,omitempty"`
+	History              []HistoryEntry `json:"history"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
 	// LastUserActivity records when a real user message was last received.
 	// Unlike UpdatedAt (bumped by every session.Unlock including heartbeats and
 	// unsolicited agent output), this field is only updated when the engine
@@ -140,6 +144,27 @@ func (s *Session) GetName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Name
+}
+
+// SetCollaborationChannel records an explicit collaboration choice. Empty is
+// meaningful: it prevents a later host activation from restoring an old thread
+// after the user turned collaboration off.
+func (s *Session) SetCollaborationChannel(channel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value := strings.ToLower(strings.TrimSpace(channel))
+	s.CollaborationChannel = &value
+}
+
+// GetCollaborationChannel returns (channel, true) for an explicit persisted
+// choice, including explicit off ("", true). false means a legacy snapshot.
+func (s *Session) GetCollaborationChannel() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.CollaborationChannel == nil {
+		return "", false
+	}
+	return *s.CollaborationChannel, true
 }
 
 // TouchUserActivity records the current time as the last user-driven activity
@@ -324,6 +349,9 @@ func (sm *SessionManager) nextID() string {
 func (sm *SessionManager) GetOrCreateActive(userKey string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 
 	if sid, ok := sm.activeSession[userKey]; ok {
 		if s, ok := sm.sessions[sid]; ok {
@@ -331,15 +359,18 @@ func (sm *SessionManager) GetOrCreateActive(userKey string) *Session {
 		}
 	}
 	s := sm.createLocked(userKey, "default")
-	sm.saveLocked()
+	sm.saveLockedNoStoreLock()
 	return s
 }
 
 func (sm *SessionManager) NewSession(userKey, name string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 	s := sm.createLocked(userKey, name)
-	sm.saveLocked()
+	sm.saveLockedNoStoreLock()
 	return s
 }
 
@@ -349,6 +380,9 @@ func (sm *SessionManager) NewSession(userKey, name string) *Session {
 func (sm *SessionManager) NewSideSession(userKey, name string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 	id := sm.nextID()
 	now := time.Now()
 	s := &Session{
@@ -359,7 +393,7 @@ func (sm *SessionManager) NewSideSession(userKey, name string) *Session {
 	}
 	sm.sessions[id] = s
 	sm.userSessions[userKey] = append(sm.userSessions[userKey], id)
-	sm.saveLocked()
+	sm.saveLockedNoStoreLock()
 	return s
 }
 
@@ -400,9 +434,12 @@ func (sm *SessionManager) SwitchSession(userKey, target string) (*Session, error
 func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, summary string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 
-	for _, sid := range sm.userSessions[userKey] {
-		s := sm.sessions[sid]
+	var matches []*Session
+	for _, s := range sm.sessions {
 		if s == nil {
 			continue
 		}
@@ -410,16 +447,118 @@ func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, sum
 		aid := s.AgentSessionID
 		s.mu.Unlock()
 		if aid == agentSID {
-			sm.activeSession[userKey] = s.ID
-			sm.saveLocked()
-			return s
+			matches = append(matches, s)
 		}
+	}
+	if len(matches) > 0 {
+		sort.Slice(matches, func(i, j int) bool { return matches[i].ID < matches[j].ID })
+		selected := matches[0]
+		for _, duplicate := range matches[1:] {
+			duplicate.SetAgentSessionID("", "")
+		}
+		sm.removeSessionFromUserKeysLocked(selected.ID)
+		sm.userSessions[userKey] = append(sm.userSessions[userKey], selected.ID)
+		sm.activeSession[userKey] = selected.ID
+		sm.saveLockedNoStoreLock()
+		return selected
 	}
 
 	s := sm.createLocked(userKey, summary)
 	s.SetAgentInfo(agentSID, agentName, summary)
-	sm.saveLocked()
+	sm.saveLockedNoStoreLock()
 	return s
+}
+
+// TrySwitchToAgentSession atomically publishes a new active mapping with the
+// selected Session already busy. Callers use the retained lock to prevent a
+// normal inbound turn from observing a half-committed live AgentSession swap.
+// The returned Session must be unlocked by the caller.
+func (sm *SessionManager) TrySwitchToAgentSession(
+	userKey, agentSID, agentName, summary string,
+) (*Session, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
+
+	var matches []*Session
+	for _, s := range sm.sessions {
+		if s == nil {
+			continue
+		}
+		s.mu.Lock()
+		aid := s.AgentSessionID
+		s.mu.Unlock()
+		if aid == agentSID {
+			matches = append(matches, s)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].ID < matches[j].ID })
+
+	var selected *Session
+	if len(matches) > 0 {
+		selected = matches[0]
+		selected.mu.Lock()
+		if selected.busy {
+			selected.mu.Unlock()
+			return nil, fmt.Errorf("session %q is busy", agentSID)
+		}
+		selected.busy = true
+		selected.mu.Unlock()
+		for _, duplicate := range matches[1:] {
+			duplicate.SetAgentSessionID("", "")
+		}
+		sm.removeSessionFromUserKeysLocked(selected.ID)
+		sm.userSessions[userKey] = append(sm.userSessions[userKey], selected.ID)
+		sm.activeSession[userKey] = selected.ID
+	} else {
+		selected = sm.createLocked(userKey, summary)
+		selected.SetAgentInfo(agentSID, agentName, summary)
+		selected.mu.Lock()
+		selected.busy = true
+		selected.mu.Unlock()
+	}
+	sm.saveLockedNoStoreLock()
+	return selected, nil
+}
+
+func (sm *SessionManager) removeSessionFromUserKeysLocked(sessionID string) {
+	for key, ids := range sm.userSessions {
+		filtered := ids[:0]
+		for _, id := range ids {
+			if id != sessionID {
+				filtered = append(filtered, id)
+			}
+		}
+		sm.userSessions[key] = filtered
+		if sm.activeSession[key] == sessionID {
+			delete(sm.activeSession, key)
+		}
+	}
+}
+
+// SessionKeyForAgentSessionID returns the sole durable thread mapping for an
+// external host session. Uniqueness is enforced by SwitchToAgentSession.
+// This is a Java Session Host extension with no upstream TS equivalent.
+func (sm *SessionManager) SessionKeyForAgentSessionID(agentSessionID string) (string, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	keys := make([]string, 0, len(sm.userSessions))
+	for key := range sm.userSessions {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		ids := sm.userSessions[key]
+		for _, id := range ids {
+			s := sm.sessions[id]
+			if s != nil && s.GetAgentSessionID() == agentSessionID {
+				return key, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (sm *SessionManager) ListSessions(userKey string) []*Session {
@@ -565,11 +704,14 @@ func (sm *SessionManager) FindByID(id string) *Session {
 func (sm *SessionManager) DeleteByID(id string) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 	if _, ok := sm.sessions[id]; !ok {
 		return false
 	}
 	sm.deleteByIDLocked(id)
-	sm.saveLocked()
+	sm.saveLockedNoStoreLock()
 	return true
 }
 
@@ -582,6 +724,9 @@ func (sm *SessionManager) DeleteByAgentSessionID(agentSessionID string) int {
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 
 	removed := 0
 	for id, s := range sm.sessions {
@@ -595,7 +740,7 @@ func (sm *SessionManager) DeleteByAgentSessionID(agentSessionID string) int {
 		removed++
 	}
 	if removed > 0 {
-		sm.saveLocked()
+		sm.saveLockedNoStoreLock()
 	}
 	return removed
 }
@@ -617,12 +762,19 @@ func (sm *SessionManager) deleteByIDLocked(id string) {
 
 // Save persists current state to disk. Safe to call from outside (e.g. after message processing).
 func (sm *SessionManager) Save() {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	sm.saveLocked()
 }
 
 func (sm *SessionManager) saveLocked() {
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
+	sm.saveLockedNoStoreLock()
+}
+
+func (sm *SessionManager) saveLockedNoStoreLock() {
 	if sm.storePath == "" {
 		return
 	}
@@ -637,14 +789,17 @@ func (sm *SessionManager) saveLocked() {
 			s.AgentSessionID = ""
 		}
 		snapSessions[id] = &Session{
-			ID:                  s.ID,
-			Name:                s.Name,
-			AgentSessionID:      agentSID,
-			AgentType:           s.AgentType,
-			PastAgentSessionIDs: append([]string(nil), s.PastAgentSessionIDs...),
-			History:             append([]HistoryEntry(nil), s.History...),
-			CreatedAt:           s.CreatedAt,
-			UpdatedAt:           s.UpdatedAt,
+			ID:                   s.ID,
+			Name:                 s.Name,
+			AgentSessionID:       agentSID,
+			AgentType:            s.AgentType,
+			PastAgentSessionIDs:  append([]string(nil), s.PastAgentSessionIDs...),
+			ActiveProvider:       s.ActiveProvider,
+			CollaborationChannel: cloneStringPtr(s.CollaborationChannel),
+			History:              append([]HistoryEntry(nil), s.History...),
+			CreatedAt:            s.CreatedAt,
+			UpdatedAt:            s.UpdatedAt,
+			LastUserActivity:     s.LastUserActivity,
 		}
 		s.mu.Unlock()
 	}
@@ -687,6 +842,144 @@ func (sm *SessionManager) saveLocked() {
 	if err := AtomicWriteFile(sm.storePath, data, 0o644); err != nil {
 		slog.Error("session: failed to write", "path", sm.storePath, "error", err)
 	}
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func (sm *SessionManager) lockStore() func() {
+	if sm.storePath == "" {
+		return func() {}
+	}
+	if err := os.MkdirAll(filepath.Dir(sm.storePath), 0o755); err != nil {
+		slog.Error("session: failed to create lock dir", "error", err)
+		return func() {}
+	}
+	file, err := os.OpenFile(sm.storePath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		slog.Error("session: failed to open transaction lock", "error", err)
+		return func() {}
+	}
+	if err := lockFile(file); err != nil {
+		_ = file.Close()
+		slog.Error("session: failed to acquire transaction lock", "error", err)
+		return func() {}
+	}
+	return func() {
+		_ = unlockFile(file)
+		_ = file.Close()
+	}
+}
+
+// mergeStoreLocked merges state written by peer SessionManager processes before
+// committing a local transaction. IDs allocated by peers and per-user indexes
+// are retained, preventing whole-file last-writer-wins data loss.
+func (sm *SessionManager) mergeStoreLocked() {
+	if sm.storePath == "" {
+		return
+	}
+	data, err := os.ReadFile(sm.storePath)
+	if err != nil {
+		return
+	}
+	var disk sessionSnapshot
+	if json.Unmarshal(data, &disk) != nil {
+		return
+	}
+	for id, session := range disk.Sessions {
+		local, exists := sm.sessions[id]
+		if !exists {
+			sm.sessions[id] = session
+			continue
+		}
+		mergeConcurrentSessionUpdates(local, session)
+	}
+	for key, ids := range disk.UserSessions {
+		seen := make(map[string]bool, len(sm.userSessions[key]))
+		for _, id := range sm.userSessions[key] {
+			seen[id] = true
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				sm.userSessions[key] = append(sm.userSessions[key], id)
+				seen[id] = true
+			}
+		}
+	}
+	for key, id := range disk.ActiveSession {
+		if _, exists := sm.activeSession[key]; !exists {
+			sm.activeSession[key] = id
+		}
+	}
+	for id, name := range disk.SessionNames {
+		if _, exists := sm.sessionNames[id]; !exists {
+			sm.sessionNames[id] = name
+		}
+	}
+	for key, meta := range disk.UserMeta {
+		if _, exists := sm.userMeta[key]; !exists {
+			sm.userMeta[key] = meta
+		}
+	}
+	if disk.Counter > sm.counter {
+		sm.counter = disk.Counter
+	}
+}
+
+func mergeConcurrentSessionUpdates(local, remote *Session) {
+	if local == nil || remote == nil {
+		return
+	}
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	// Empty local history is an intentional ClearHistory and must stay empty.
+	// Otherwise histories are append-only, so union peer appends by their stable
+	// persisted tuple and retain chronological order.
+	if len(local.History) > 0 && len(remote.History) > 0 {
+		seen := make(map[string]bool, len(local.History))
+		for _, entry := range local.History {
+			seen[historyEntryKey(entry)] = true
+		}
+		for _, entry := range remote.History {
+			if key := historyEntryKey(entry); !seen[key] {
+				local.History = append(local.History, entry)
+				seen[key] = true
+			}
+		}
+		sort.SliceStable(local.History, func(i, j int) bool {
+			return local.History[i].Timestamp.Before(local.History[j].Timestamp)
+		})
+	}
+	for _, id := range remote.PastAgentSessionIDs {
+		found := false
+		for _, localID := range local.PastAgentSessionIDs {
+			if localID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			local.PastAgentSessionIDs = append(local.PastAgentSessionIDs, id)
+		}
+	}
+	if remote.UpdatedAt.After(local.UpdatedAt) {
+		local.UpdatedAt = remote.UpdatedAt
+	}
+	if remote.LastUserActivity.After(local.LastUserActivity) {
+		local.LastUserActivity = remote.LastUserActivity
+	}
+	if local.CollaborationChannel == nil && remote.CollaborationChannel != nil {
+		local.CollaborationChannel = cloneStringPtr(remote.CollaborationChannel)
+	}
+}
+
+func historyEntryKey(entry HistoryEntry) string {
+	return entry.Timestamp.UTC().Format(time.RFC3339Nano) + "\x00" + entry.Role + "\x00" + entry.Content
 }
 
 func (sm *SessionManager) load() {
@@ -826,9 +1119,12 @@ type PruneResult struct {
 func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {
@@ -934,7 +1230,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	}
 
 	if len(result.RemovedSessions) > 0 {
-		sm.saveLocked()
+		sm.saveLockedNoStoreLock()
 		slog.Info("session: prune complete",
 			"removed", len(result.RemovedSessions),
 			"merged_history", result.MergedHistory,
@@ -949,6 +1245,9 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 func (sm *SessionManager) PruneEmptySessions() int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	unlock := sm.lockStore()
+	defer unlock()
+	sm.mergeStoreLocked()
 
 	removed := 0
 	for _, s := range sm.sessions {
@@ -963,7 +1262,7 @@ func (sm *SessionManager) PruneEmptySessions() int {
 	}
 
 	if removed > 0 {
-		sm.saveLocked()
+		sm.saveLockedNoStoreLock()
 		slog.Info("session: pruned empty sessions", "removed", removed)
 	}
 	return removed

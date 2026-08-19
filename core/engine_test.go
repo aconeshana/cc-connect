@@ -58,6 +58,24 @@ type stubPlatformEngine struct {
 	mu   sync.Mutex
 }
 
+type stopWaitingPlatform struct {
+	stubPlatformEngine
+	sendStarted chan struct{}
+	releaseSend chan struct{}
+}
+
+func (p *stopWaitingPlatform) Send(_ context.Context, _ any, content string) error {
+	select {
+	case p.sendStarted <- struct{}{}:
+	default:
+	}
+	<-p.releaseSend
+	p.mu.Lock()
+	p.sent = append(p.sent, content)
+	p.mu.Unlock()
+	return nil
+}
+
 func (p *stubPlatformEngine) Name() string               { return p.n }
 func (p *stubPlatformEngine) Start(MessageHandler) error { return nil }
 func (p *stubPlatformEngine) Reply(_ context.Context, _ any, content string) error {
@@ -86,6 +104,44 @@ func (p *stubPlatformEngine) clearSent() {
 	p.mu.Lock()
 	p.sent = nil
 	p.mu.Unlock()
+}
+
+func TestEngineStopWaitsForAcceptedMessageWorker(t *testing.T) {
+	p := &stopWaitingPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		sendStarted:        make(chan struct{}, 1),
+		releaseSend:        make(chan struct{}),
+	}
+	e := NewEngine("test", &resultAgent{session: newResultAgentSession("done")}, []Platform{p},
+		filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey: "test:chat:user", Platform: "test", UserID: "user",
+		Content: "hello", ReplyCtx: "ctx",
+	})
+	select {
+	case <-p.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not reach the blocking platform send")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- e.Stop() }()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop returned before the accepted worker exited: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(p.releaseSend)
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after the worker was released")
+	}
 }
 
 type recallCheckingPlatform struct {
@@ -306,6 +362,77 @@ type stubCardPlatform struct {
 	cardErr        error
 }
 
+type stubTrackableCardPlatform struct {
+	stubCardPlatform
+	updatedCards       []*Card
+	updateHandles      []any
+	sendCardStarted    chan struct{}
+	sendCardRelease    chan struct{}
+	sendCardStartOne   sync.Once
+	updateCardStarted  chan struct{}
+	updateCardRelease  chan struct{}
+	updateCardStartOne sync.Once
+	updateCardErr      error
+}
+
+type saturatingTrackableCardSender struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *saturatingTrackableCardSender) SendCardWithHandle(
+	_ context.Context, _ any, _ *Card,
+) (any, error) {
+	return "unused", nil
+}
+
+func (s *saturatingTrackableCardSender) UpdateCard(
+	_ context.Context, _ any, _ *Card,
+) error {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return nil
+}
+
+func (p *stubTrackableCardPlatform) SendCardWithHandle(_ context.Context, _ any, card *Card) (any, error) {
+	if p.sendCardStarted != nil {
+		p.sendCardStartOne.Do(func() { close(p.sendCardStarted) })
+	}
+	if p.sendCardRelease != nil {
+		<-p.sendCardRelease
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cardErr != nil {
+		return nil, p.cardErr
+	}
+	p.sentCards = append(p.sentCards, card)
+	return "card-1", nil
+}
+
+func (p *stubTrackableCardPlatform) UpdateCard(_ context.Context, handle any, card *Card) error {
+	if p.updateCardStarted != nil {
+		p.updateCardStartOne.Do(func() { close(p.updateCardStarted) })
+	}
+	if p.updateCardRelease != nil {
+		<-p.updateCardRelease
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.updateCardErr != nil {
+		return p.updateCardErr
+	}
+	if p.cardErr != nil {
+		return p.cardErr
+	}
+	p.updateHandles = append(p.updateHandles, handle)
+	p.updatedCards = append(p.updatedCards, card)
+	return nil
+}
+
 func (p *stubCardPlatform) ReplyCard(_ context.Context, _ any, card *Card) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -455,6 +582,40 @@ type stubStrictModelAgent struct {
 	calls  int
 }
 
+type stubSessionModelAgent struct {
+	stubAgent
+	mu       sync.Mutex
+	states   map[string]SessionModelState
+	lastGet  string
+	lastSet  string
+	lastName string
+	err      error
+}
+
+func (a *stubSessionModelAgent) GetSessionModel(_ context.Context, sessionID string) (SessionModelState, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastGet = sessionID
+	if a.err != nil {
+		return SessionModelState{}, a.err
+	}
+	return a.states[sessionID], nil
+}
+
+func (a *stubSessionModelAgent) SetSessionModel(_ context.Context, sessionID, model string) (SessionModelState, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastSet = sessionID
+	a.lastName = model
+	if a.err != nil {
+		return SessionModelState{}, a.err
+	}
+	state := a.states[sessionID]
+	state.Current = model
+	a.states[sessionID] = state
+	return state, nil
+}
+
 type stubLiveModeSession struct {
 	stubAgentSession
 	modes []string
@@ -551,6 +712,49 @@ func (a *stubModelModeAgent) AvailableReasoningEfforts() []string {
 type namedStubModelModeAgent struct {
 	stubModelModeAgent
 	name string
+}
+
+type stubSessionEffortAgent struct {
+	stubAgent
+	current  string
+	setIDs   []string
+	getCalls int
+	setCalls int
+	getErr   error
+	setErr   error
+}
+
+func (a *stubSessionEffortAgent) GetSessionReasoningEffort(
+	_ context.Context, sessionID string,
+) (SessionReasoningEffortState, error) {
+	a.getCalls++
+	if a.getErr != nil {
+		return SessionReasoningEffortState{}, a.getErr
+	}
+	return a.effortState(), nil
+}
+
+func (a *stubSessionEffortAgent) effortState() SessionReasoningEffortState {
+	effective := a.current
+	if effective == "auto" {
+		effective = "high"
+	}
+	return SessionReasoningEffortState{
+		Current: a.current, Effective: effective,
+		Efforts: []string{"auto", "low", "medium", "high", "xhigh", "max"},
+	}
+}
+
+func (a *stubSessionEffortAgent) SetSessionReasoningEffort(
+	_ context.Context, sessionID, effort string,
+) (SessionReasoningEffortState, error) {
+	a.setIDs = append(a.setIDs, sessionID)
+	a.setCalls++
+	if a.setErr != nil {
+		return SessionReasoningEffortState{}, a.setErr
+	}
+	a.current = effort
+	return a.effortState(), nil
 }
 
 func (a *namedStubModelModeAgent) Name() string {
@@ -3034,6 +3238,86 @@ func TestSendPermissionPrompt_CardPlatform(t *testing.T) {
 	}
 }
 
+func TestSendPermissionPrompt_CardIncludesDecisionContext(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+
+	e.sendPermissionPrompt(p, "ctx", "full prompt text", "Bash", "find ~/Downloads", PermissionPromptContext{
+		UserInput: "检查下载目录", Model: "claude-opus-4-6", WorkDir: "/workspace/project",
+		PermissionMode: "default", ModelOutput: "我先查看 Downloads 目录。",
+		DecisionReasonType: "rule", DecisionReasonDetail: "Bash(find:*)",
+		DestructiveWarning: "May expose private filenames", CustomMessage: "Review directory access",
+		ToolDescription: "Runs a shell command", SuggestionLabel: "find commands in this project",
+		SuggestionRuleContent: "find:*", WorkerID: "researcher", WorkerColor: "blue",
+	})
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected one card, got %d", len(p.sentCards))
+	}
+	body := p.sentCards[0].RenderText()
+	for _, want := range []string{
+		"检查下载目录", "claude-opus-4-6", "/workspace/project", "default",
+		"我先查看 Downloads 目录", "Bash(find:*)", "May expose private filenames",
+		"Review directory access", "Runs a shell command", "find commands in this project",
+		"find:*", "researcher", "blue",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("card missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestSendPermissionPrompt_BindsActionsToRequestID(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+
+	e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "pwd",
+		PermissionPromptContext{RequestID: "req-card-1"})
+
+	buttons := p.sentCards[0].CollectButtons()
+	if got := buttons[0][0].Data; got != "perm:req-card-1:allow" {
+		t.Fatalf("allow action = %q", got)
+	}
+	if got := buttons[0][1].Data; got != "perm:req-card-1:deny" {
+		t.Fatalf("deny action = %q", got)
+	}
+	if got := buttons[1][0].Data; got != "perm:req-card-1:allow_all" {
+		t.Fatalf("allow-all action = %q", got)
+	}
+}
+
+func TestSendPermissionPrompt_ContextIsBoundedForCardCallbacks(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	huge := strings.Repeat("审批上下文", 5000)
+
+	e.sendPermissionPrompt(p, "ctx", "full prompt text", "Bash", huge, PermissionPromptContext{
+		UserInput: huge, ModelOutput: huge, DecisionReasonDetail: huge,
+		DestructiveWarning: huge, CustomMessage: huge, ToolDescription: huge,
+	})
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected one card, got %d", len(p.sentCards))
+	}
+	body := p.sentCards[0].RenderText()
+	if utf8.RuneCountInString(body) > permissionCardBodyMaxRunes+200 {
+		t.Fatalf("permission card body has %d runes, expected bounded near %d",
+			utf8.RuneCountInString(body), permissionCardBodyMaxRunes)
+	}
+	for _, element := range p.sentCards[0].Elements {
+		actions, ok := element.(CardActions)
+		if !ok {
+			continue
+		}
+		for _, button := range actions.Buttons {
+			if callbackBody := button.Extra["perm_body"]; utf8.RuneCountInString(callbackBody) > permissionCardBodyMaxRunes {
+				t.Fatalf("callback body has %d runes, max %d",
+					utf8.RuneCountInString(callbackBody), permissionCardBodyMaxRunes)
+			}
+		}
+	}
+}
+
 func TestSendPermissionPrompt_InlineButtonPlatform(t *testing.T) {
 	e := newTestEngine()
 	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
@@ -3051,6 +3335,22 @@ func TestSendPermissionPrompt_InlineButtonPlatform(t *testing.T) {
 	}
 }
 
+func TestSendPermissionPrompt_InlineButtonIncludesContext(t *testing.T) {
+	e := newTestEngine()
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+
+	e.sendPermissionPrompt(p, "ctx", "full prompt text", "Bash", "find ~/Downloads", PermissionPromptContext{
+		UserInput: "检查下载目录", Model: "claude-opus-4-6",
+		DecisionReasonDetail: "Bash(find:*)",
+	})
+
+	for _, want := range []string{"检查下载目录", "claude-opus-4-6", "Bash(find:*)", "find ~/Downloads"} {
+		if !strings.Contains(p.buttonContent, want) {
+			t.Fatalf("inline prompt missing %q: %s", want, p.buttonContent)
+		}
+	}
+}
+
 func TestSendPermissionPrompt_PlainPlatform(t *testing.T) {
 	e := newTestEngine()
 	p := &stubPlatformEngine{n: "plain"}
@@ -3059,6 +3359,25 @@ func TestSendPermissionPrompt_PlainPlatform(t *testing.T) {
 
 	if len(p.sent) != 1 || p.sent[0] != "full prompt text" {
 		t.Errorf("expected plain text fallback, got %v", p.sent)
+	}
+}
+
+func TestSendPermissionPrompt_PlainPlatformIncludesContext(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "plain"}
+
+	e.sendPermissionPrompt(p, "ctx", "full prompt text", "Bash", "find ~/Downloads", PermissionPromptContext{
+		UserInput: "检查下载目录", Model: "claude-opus-4-6",
+		DecisionReasonDetail: "Bash(find:*)",
+	})
+
+	if len(p.sent) != 1 {
+		t.Fatalf("expected one plain fallback, got %v", p.sent)
+	}
+	for _, want := range []string{"检查下载目录", "claude-opus-4-6", "Bash(find:*)", "find ~/Downloads"} {
+		if !strings.Contains(p.sent[0], want) {
+			t.Fatalf("plain prompt missing %q: %s", want, p.sent[0])
+		}
 	}
 }
 
@@ -4453,6 +4772,81 @@ func TestCmdModel_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	}
 }
 
+func TestCmdModel_SessionScopedCapabilityTargetsBoundHostSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubSessionModelAgent{states: map[string]SessionModelState{
+		"host-session-a": {
+			Current: "sonnet",
+			Models:  []ModelOption{{Name: "sonnet", Alias: "sol"}, {Name: "opus"}},
+		},
+		"host-session-b": {Current: "haiku", Models: []ModelOption{{Name: "haiku"}}},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "plain:thread-a", ReplyCtx: "ctx"}
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("host-session-a", "sessionhost")
+
+	e.cmdModel(p, msg, []string{"switch", "sol"})
+
+	if agent.lastSet != "host-session-a" || agent.lastName != "sonnet" {
+		t.Fatalf("session model switch = session %q model %q", agent.lastSet, agent.lastName)
+	}
+	if got := agent.states["host-session-b"].Current; got != "haiku" {
+		t.Fatalf("unrelated session model = %q, want haiku", got)
+	}
+	if got := e.sessions.GetOrCreateActive(msg.SessionKey).GetAgentSessionID(); got != "host-session-a" {
+		t.Fatalf("agent session id = %q, want preserved", got)
+	}
+}
+
+func TestRenderModelCard_SessionScopedCapabilityUsesBoundSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	agent := &stubSessionModelAgent{states: map[string]SessionModelState{
+		"host-session-a": {
+			Current: "sonnet",
+			Models:  []ModelOption{{Name: "sonnet", Desc: "Balanced"}, {Name: "opus"}},
+		},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "feishu:thread-a"
+	e.sessions.GetOrCreateActive(sessionKey).SetAgentSessionID("host-session-a", "sessionhost")
+
+	card := e.renderModelCard(sessionKey)
+	if card == nil || !strings.Contains(card.RenderText(), "sonnet") {
+		t.Fatalf("model card = %#v", card)
+	}
+	if agent.lastGet != "host-session-a" {
+		t.Fatalf("model query session = %q, want host-session-a", agent.lastGet)
+	}
+}
+
+func TestHandleModelCardAction_SessionScopedCapabilityKeepsLivePTYAttached(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	agent := &stubSessionModelAgent{states: map[string]SessionModelState{
+		"host-session-a": {
+			Current: "sonnet",
+			Models:  []ModelOption{{Name: "sonnet"}, {Name: "opus"}},
+		},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "feishu:thread-a"
+	e.sessions.GetOrCreateActive(sessionKey).SetAgentSessionID("host-session-a", "sessionhost")
+	live := &stubAgentSession{}
+	e.interactiveStates[sessionKey] = &interactiveState{agentSession: live}
+
+	card := e.handleModelCardAction("switch 2", sessionKey)
+
+	if card == nil || !strings.Contains(card.RenderText(), "opus") {
+		t.Fatalf("model switch card = %#v", card)
+	}
+	state := e.interactiveStates[sessionKey]
+	if state == nil || state.agentSession != live {
+		t.Fatal("session-scoped model switch detached the live PTY session")
+	}
+	if got := e.sessions.GetOrCreateActive(sessionKey).GetAgentSessionID(); got != "host-session-a" {
+		t.Fatalf("agent session id = %q, want preserved", got)
+	}
+}
+
 func TestCmdModel_UpdatesActiveProviderModel(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	agent := &stubModelModeAgent{
@@ -4846,6 +5240,28 @@ func TestGetOrCreateWorkspaceAgent_InheritsActiveProvider(t *testing.T) {
 	if got := wsAgent.GetActiveProvider(); got == nil || got.Name != "azure" {
 		t.Fatalf("workspace active provider = %#v, want azure", got)
 	}
+}
+
+func TestGetOrCreateWorkspaceAgent_EmptyParentStoreRemainsInMemory(t *testing.T) {
+	agentName := "test-workspace-in-memory-sessions"
+	RegisterAgent(agentName, func(opts map[string]any) (Agent, error) {
+		return &namedStubWorkDirAgent{
+			stubWorkDirAgent: stubWorkDirAgent{workDir: opts["work_dir"].(string)},
+			name:             agentName,
+		}, nil
+	})
+
+	e := NewEngine("test", &namedStubWorkDirAgent{name: agentName}, nil, "", LangEnglish)
+	workspace := normalizeWorkspacePath(t.TempDir())
+	_, sessions, err := e.getOrCreateWorkspaceAgent(workspace)
+	if err != nil {
+		t.Fatalf("getOrCreateWorkspaceAgent returned error: %v", err)
+	}
+	if got := sessions.StorePath(); got != "" {
+		t.Fatalf("workspace session store path = %q, want in-memory empty path", got)
+	}
+	sessions.GetOrCreateActive("test:user")
+	sessions.Save()
 }
 
 func TestGetOrCreateWorkspaceAgent_InheritsSnapshotOptions(t *testing.T) {
@@ -5419,6 +5835,97 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	}
 	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Reasoning effort switched to `high`") {
 		t.Fatalf("sent = %v, want reasoning changed message", p.sent)
+	}
+}
+
+func TestCmdEffortSwitchesLiveHostSessionWithoutResettingTranscript(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubSessionEffortAgent{current: "auto"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("java-session", "sessionhost")
+	s.AddHistory("user", "keep me")
+
+	e.cmdReasoning(p, msg, []string{"2"})
+
+	if agent.current != "low" || len(agent.setIDs) != 1 || agent.setIDs[0] != "java-session" {
+		t.Fatalf("session effort = %q ids=%v, want low on java-session", agent.current, agent.setIDs)
+	}
+	if s.GetAgentSessionID() != "java-session" || len(s.History) != 1 {
+		t.Fatalf("live effort switch reset session: id=%q history=%d", s.GetAgentSessionID(), len(s.History))
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Reasoning effort switched to `low`") {
+		t.Fatalf("sent = %v", p.sent)
+	}
+}
+
+func TestEffortCardActionTargetsHostSessionWithoutResettingIt(t *testing.T) {
+	agent := &stubSessionEffortAgent{current: "auto"}
+	e := NewEngine("test", agent, nil, "", LangEnglish)
+	key := "feishu:thread-1"
+	s := e.sessions.GetOrCreateActive(key)
+	s.SetAgentSessionID("java-session", "sessionhost")
+	s.AddHistory("user", "keep me")
+
+	card := e.handleCardNav("act:/reasoning 3", key)
+
+	if card == nil || card.Header == nil || card.Header.Color != "green" ||
+		!strings.Contains(card.RenderText(), "Reasoning effort switched to `medium` for this session") {
+		t.Fatalf("updated effort card = %#v", card)
+	}
+	if len(card.Elements) != 2 {
+		t.Fatalf("success card elements = %#v, want confirmation + back button", card.Elements)
+	}
+	actions, ok := card.Elements[1].(CardActions)
+	if !ok || len(actions.Buttons) != 1 || actions.Buttons[0].Value != "nav:/reasoning" {
+		t.Fatalf("success card back action = %#v, want nav:/reasoning", card.Elements[1])
+	}
+	if agent.current != "medium" || len(agent.setIDs) != 1 || agent.setIDs[0] != "java-session" {
+		t.Fatalf("card effort = %q ids=%v", agent.current, agent.setIDs)
+	}
+	if s.GetAgentSessionID() != "java-session" || len(s.History) != 1 {
+		t.Fatalf("card effort reset session: id=%q history=%d", s.GetAgentSessionID(), len(s.History))
+	}
+}
+
+func TestEffortCardActionUsesAuthoritativeSetResponseWithoutSecondRead(t *testing.T) {
+	agent := &stubSessionEffortAgent{current: "high"}
+	e := NewEngine("test", agent, nil, "", LangEnglish)
+	key := "feishu:thread-authoritative-effort"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("java-session", "sessionhost")
+
+	card := e.handleCardNav("act:/reasoning 1", key)
+
+	if agent.current != "auto" || agent.setCalls != 1 {
+		t.Fatalf("effort current=%q setCalls=%d, want auto/1", agent.current, agent.setCalls)
+	}
+	if agent.getCalls != 1 {
+		t.Fatalf("effort getCalls=%d, want one pre-set capability read and no stale post-set read", agent.getCalls)
+	}
+	if card == nil || card.Header == nil || card.Header.Color != "green" ||
+		!strings.Contains(card.RenderText(), "Reasoning effort switched to `auto` for this session") {
+		t.Fatalf("authoritative auto card = %#v", card)
+	}
+}
+
+func TestEffortCardActionShowsSetFailureInsteadOfRenderingStaleState(t *testing.T) {
+	agent := &stubSessionEffortAgent{current: "high", setErr: errors.New("session link unavailable")}
+	e := NewEngine("test", agent, nil, "", LangEnglish)
+	key := "feishu:thread-effort-error"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("java-session", "sessionhost")
+
+	card := e.handleCardNav("act:/reasoning 2", key)
+
+	if agent.current != "high" || agent.getCalls != 1 || agent.setCalls != 1 {
+		t.Fatalf("effort state=%q getCalls=%d setCalls=%d, want unchanged/1/1",
+			agent.current, agent.getCalls, agent.setCalls)
+	}
+	if card == nil || card.Header == nil || card.Header.Color != "red" {
+		t.Fatalf("failed effort action card = %#v", card)
+	}
+	if !strings.Contains(card.RenderText(), "Unable to change reasoning effort") {
+		t.Fatalf("failure card exposed stale success state: %s", card.RenderText())
 	}
 }
 
@@ -6509,6 +7016,16 @@ func TestResolveAskQuestionAnswer_MultiSelect(t *testing.T) {
 	}
 }
 
+func TestResolveAskQuestionAnswer_MultiSelectFreeText(t *testing.T) {
+	e := newTestEngine()
+	q := testQuestions()[0]
+	q.MultiSelect = true
+	got := e.resolveAskQuestionAnswer(q, "Redis and SQLite")
+	if got != "Redis and SQLite" {
+		t.Errorf("expected free-text answer to pass through, got %s", got)
+	}
+}
+
 func TestResolveAskQuestionAnswer_OutOfRange(t *testing.T) {
 	e := newTestEngine()
 	q := testQuestions()[0]
@@ -6552,8 +7069,12 @@ func TestSendAskQuestionPrompt_CardPlatform(t *testing.T) {
 		t.Errorf("expected blue header, got %+v", card.Header)
 	}
 	askqCount := countCardActionValues(card, "askq:")
-	if askqCount != 3 {
-		t.Errorf("expected 3 askq buttons, got %d", askqCount)
+	if askqCount != 4 {
+		t.Errorf("expected 3 options plus Other, got %d AskUserQuestion buttons", askqCount)
+	}
+	rows := card.CollectButtons()
+	if got := rows[len(rows)-1][0]; got.Text != "Other…" || got.Data != "askq:0:other" {
+		t.Fatalf("last AskUserQuestion action = %#v, want explicit Other action", got)
 	}
 }
 
@@ -6572,16 +7093,65 @@ func TestSendAskQuestionPrompt_CardPlatform_MultiQuestion_ShowsIndex(t *testing.
 	}
 }
 
+func TestSendAskQuestionPrompt_BindsActionsToRequestID(t *testing.T) {
+	e := newTestEngine()
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+
+	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0, "ask-card-1")
+
+	if got := p.buttonRows[0][0].Data; got != "askq:ask-card-1:0:1" {
+		t.Fatalf("first AskUserQuestion action = %q", got)
+	}
+}
+
+func TestSendAskQuestionPrompt_CardPlatform_MultiSelectShowsOtherOption(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	questions := testQuestions()
+	questions[0].MultiSelect = true
+
+	e.sendAskQuestionPrompt(p, "ctx", questions, 0, "req-multi-other")
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
+	}
+	body := p.sentCards[0].RenderText()
+	if !strings.Contains(body, "Other") || !strings.Contains(body, "natural-language") {
+		t.Fatalf("multi-select card should expose a natural-language Other option: %s", body)
+	}
+	rows := p.sentCards[0].CollectButtons()
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0].Data != "askq:req-multi-other:0:other" {
+		t.Fatalf("multi-select Other action = %#v, want request-bound explicit Other button", rows)
+	}
+}
+
 func TestSendAskQuestionPrompt_InlineButtonPlatform(t *testing.T) {
 	e := newTestEngine()
 	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
 	e.sendAskQuestionPrompt(p, "ctx", testQuestions(), 0)
 
-	if len(p.buttonRows) != 3 {
-		t.Fatalf("expected 3 button rows, got %d", len(p.buttonRows))
+	if len(p.buttonRows) != 4 {
+		t.Fatalf("expected 3 option rows plus Other, got %d", len(p.buttonRows))
 	}
 	if p.buttonRows[0][0].Data != "askq:0:1" {
 		t.Errorf("expected askq:0:1, got %s", p.buttonRows[0][0].Data)
+	}
+	if got := p.buttonRows[3][0]; got.Text != "Other…" || got.Data != "askq:0:other" {
+		t.Fatalf("last inline AskUserQuestion action = %#v, want explicit Other action", got)
+	}
+}
+
+func TestSendAskQuestionPrompt_InlineButtonPlatform_MultiSelectShowsOtherOption(t *testing.T) {
+	e := newTestEngine()
+	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	questions := testQuestions()
+	questions[0].MultiSelect = true
+
+	e.sendAskQuestionPrompt(p, "ctx", questions, 0)
+
+	if !strings.Contains(p.buttonContent, "Other") ||
+		!strings.Contains(p.buttonContent, "natural-language") {
+		t.Fatalf("multi-select inline fallback should expose Other: %s", p.buttonContent)
 	}
 }
 
@@ -6599,6 +7169,20 @@ func TestSendAskQuestionPrompt_PlainPlatform(t *testing.T) {
 	}
 	if !strings.Contains(msg, "1. **PostgreSQL**") {
 		t.Errorf("expected numbered options, got %s", msg)
+	}
+}
+
+func TestSendAskQuestionPrompt_PlainPlatform_MultiSelectShowsOtherOption(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "plain"}
+	questions := testQuestions()
+	questions[0].MultiSelect = true
+
+	e.sendAskQuestionPrompt(p, "ctx", questions, 0)
+
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Other") ||
+		!strings.Contains(p.sent[0], "natural-language") {
+		t.Fatalf("multi-select plain fallback should expose Other: %#v", p.sent)
 	}
 }
 
@@ -6658,8 +7242,8 @@ func TestProcessInteractiveEvents_AskUserQuestionFromAgent_RendersRichCardPrompt
 	if card.Header == nil || card.Header.Color != "blue" {
 		t.Fatalf("card header = %#v, want blue AskUserQuestion card", card.Header)
 	}
-	if countCardActionValues(card, "askq:") != 3 {
-		t.Fatalf("askq button count = %d, want 3", countCardActionValues(card, "askq:"))
+	if countCardActionValues(card, "askq:") != 4 {
+		t.Fatalf("askq button count = %d, want 4 including Other", countCardActionValues(card, "askq:"))
 	}
 
 	if !e.handlePendingPermission(p, &Message{
@@ -6747,6 +7331,73 @@ func TestProcessInteractiveEvents_AskUserQuestionFromAgent_RendersLegacyPrompt(t
 	}
 }
 
+func TestProcessInteractiveEvents_PermissionCardIncludesForegroundTurnContext(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	sess := newBlockingSendSession("foreground-permission-context")
+	sess.model = "claude-opus-4-6"
+	sess.reasoningEffort = "high"
+	sess.workDir = "/workspace/project"
+	e := NewEngine("test", &controllableAgent{nextSession: sess}, []Platform{p}, "", LangChinese)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode: "full", CardMode: "legacy", ThinkingMessages: true,
+		ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: true,
+	})
+
+	key := "feishu:foreground:u1"
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{
+		agentSession: sess, platform: p, replyCtx: "ctx", workspaceDir: "/workspace/project",
+		currentTurnUserInput: "检查下载目录",
+	}
+	e.interactiveStates[key] = state
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- sess.Send("检查下载目录", "m-foreground", nil, nil) }()
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "m-foreground", time.Now(), nil, sendDone, nil)
+		close(done)
+	}()
+
+	select {
+	case <-sess.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send did not reach blocking wait")
+	}
+	sess.events <- Event{Type: EventText, Content: "我先查看 Downloads 目录。"}
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "find ~/Downloads -maxdepth 1"}
+	sess.events <- Event{
+		Type: EventPermissionRequest, RequestID: "req-foreground", ToolName: "Bash",
+		ToolInput: "find ~/Downloads -maxdepth 1", PermissionMode: "default",
+		ToolInputRaw:       map[string]any{"command": "find ~/Downloads -maxdepth 1"},
+		DecisionReasonType: "rule", DecisionReasonDetail: "Bash(find:*)",
+		DestructiveWarning: "May expose private filenames", CustomMessage: "Review directory access",
+		ToolDescription: "Runs a shell command",
+	}
+
+	card := waitForSentCard(t, p)
+	body := card.RenderText()
+	for _, want := range []string{
+		"检查下载目录", "claude-opus-4-6", "high", "/workspace/project", "default",
+		"我先查看 Downloads 目录", "Bash(find:*)", "May expose private filenames",
+		"Review directory access", "Runs a shell command",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("foreground permission card missing %q: %s", want, body)
+		}
+	}
+
+	if !e.handlePendingPermission(p, &Message{SessionKey: key, ReplyCtx: "ctx"}, "allow", key) {
+		t.Fatal("expected permission answer to resolve pending request")
+	}
+	close(sess.unblock)
+	sess.events <- Event{Type: EventResult, Content: "ok", Done: true}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("processInteractiveEvents did not complete")
+	}
+}
+
 func TestHandlePendingPermission_AskUserQuestion_SingleQuestion(t *testing.T) {
 	e := newTestEngine()
 	p := &stubPlatformEngine{n: "test"}
@@ -6796,6 +7447,89 @@ func TestHandlePendingPermission_AskUserQuestion_SingleQuestion(t *testing.T) {
 		t.Error("expected pending to be cleared after response")
 	}
 	state.mu.Unlock()
+}
+
+func TestHandlePendingPermission_AskUserQuestion_OtherWaitsForNextText(t *testing.T) {
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	rec := &recordingAgentSession{}
+	questions := testQuestions()
+	presentation := e.sendAskQuestionPrompt(p, "ctx", questions, 0, "req-other-1")
+
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID:        "req-other-1",
+			ToolName:         "AskUserQuestion",
+			ToolInput:        map[string]any{"questions": []any{}},
+			Questions:        questions,
+			Resolved:         make(chan struct{}),
+			cardPresentation: presentation,
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates["feishu:chat:user1"] = state
+	e.interactiveMu.Unlock()
+
+	click := &Message{
+		SessionKey:            "feishu:chat:user1",
+		UserID:                "user1",
+		Content:               "askq:req-other-1:0:other",
+		ReplyCtx:              "ctx",
+		IsInteractionResponse: true,
+		InteractionRequestID:  "req-other-1",
+	}
+	if !e.handlePendingPermission(p, click, click.Content, click.SessionKey) {
+		t.Fatal("Other action should be consumed by the pending AskUserQuestion")
+	}
+	if !click.interactionAccepted {
+		t.Fatal("Other action should be accepted so the platform can replace the card")
+	}
+	if rec.calls != 0 {
+		t.Fatalf("Other action resolved the Agent early: RespondPermission calls = %d", rec.calls)
+	}
+	state.mu.Lock()
+	if state.pending == nil || !state.pending.AwaitingCustomAnswer {
+		state.mu.Unlock()
+		t.Fatal("pending question should remain in custom-answer mode")
+	}
+	state.mu.Unlock()
+
+	customCard := waitForUpdatedCard(t, p)
+	if customCard.Header == nil || customCard.Header.Color != "blue" ||
+		!strings.Contains(customCard.Header.Title, "Custom answer") {
+		t.Fatalf("custom-answer card header = %#v", customCard.Header)
+	}
+	if customCard.HasButtons() || !strings.Contains(customCard.RenderText(), "next text message") {
+		t.Fatalf("custom-answer card should explain the next reply and remove option buttons: %s", customCard.RenderText())
+	}
+
+	answer := &Message{
+		SessionKey: "feishu:chat:user1",
+		UserID:     "user1",
+		Content:    "Redis with cluster mode",
+		ReplyCtx:   "ctx",
+	}
+	if !e.handlePendingPermission(p, answer, answer.Content, answer.SessionKey) {
+		t.Fatal("custom text should resolve the pending AskUserQuestion")
+	}
+	if rec.calls != 1 {
+		t.Fatalf("custom text RespondPermission calls = %d, want 1", rec.calls)
+	}
+	answers, ok := rec.lastResult.UpdatedInput["answers"].(map[string]any)
+	if !ok || answers[questions[0].Question] != "Redis with cluster mode" {
+		t.Fatalf("custom answer payload = %#v", rec.lastResult.UpdatedInput)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.pending != nil {
+		t.Fatal("pending question should clear after the custom text answer")
+	}
 }
 
 func TestHandlePendingPermission_AskUserQuestion_MultiQuestion_Sequential(t *testing.T) {
@@ -8563,7 +9297,7 @@ func (s *blockingCloseAgentSession) Close() error {
 }
 
 // permSignalInlinePlatform wraps stubInlineButtonPlatform and signals when a
-// SendWithButtons call includes perm:allow, so tests do not read buttonRows
+// SendWithButtons call includes an allow action, so tests do not read buttonRows
 // from another goroutine (race with the engine under -race).
 type permSignalInlinePlatform struct {
 	stubInlineButtonPlatform
@@ -8576,7 +9310,8 @@ func (p *permSignalInlinePlatform) SendWithButtons(ctx context.Context, replyCtx
 	}
 	for _, row := range buttons {
 		for _, b := range row {
-			if b.Data == "perm:allow" {
+			_, decision, ok := ParsePermissionAction(b.Data)
+			if ok && decision == "allow" {
 				select {
 				case p.permAllowSent <- struct{}{}:
 				default:
@@ -9764,12 +10499,65 @@ type stubCompressorAgent struct {
 
 func (a *stubCompressorAgent) CompressCommand() string { return a.cmd }
 
+type stubSessionCompactorAgent struct {
+	stubAgent
+	mu           sync.Mutex
+	sessionID    string
+	instructions string
+}
+
+func (a *stubSessionCompactorAgent) CompactSession(
+	_ context.Context, sessionID, instructions string,
+) (SessionCompactionResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sessionID = sessionID
+	a.instructions = instructions
+	return SessionCompactionResult{Message: "Compacted"}, nil
+}
+
+func (a *stubSessionCompactorAgent) compactCall() (string, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionID, a.instructions
+}
+
+func TestCmdCompactTargetsLiveHostSessionWithoutSubmittingModelPrompt(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &stubSessionCompactorAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	key := "feishu:thread-compact"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("java-session", "sessionhost")
+	session.AddHistory("user", "keep history")
+
+	e.cmdCompress(p, &Message{SessionKey: key, Content: "/compact keep decisions", ReplyCtx: "ctx"},
+		[]string{"keep", "decisions"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	sessionID, instructions := agent.compactCall()
+	for sessionID == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		sessionID, instructions = agent.compactCall()
+	}
+	if sessionID != "java-session" || instructions != "keep decisions" {
+		t.Fatalf("compact target=%q instructions=%q", sessionID, instructions)
+	}
+	if session.GetAgentSessionID() != "java-session" || len(session.History) != 1 {
+		t.Fatalf("compact reset session: id=%q history=%d", session.GetAgentSessionID(), len(session.History))
+	}
+	sent := strings.Join(p.getSent(), "\n")
+	if !strings.Contains(sent, e.i18n.T(MsgCompressing)) || !strings.Contains(sent, "Compacted") {
+		t.Fatalf("sent = %q", sent)
+	}
+}
+
 func TestCmdCompress_NoCompressor_RepliesNotSupported(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 
 	msg := &Message{SessionKey: "test:user1", Content: "/compress", ReplyCtx: "ctx"}
-	e.cmdCompress(p, msg)
+	e.cmdCompress(p, msg, nil)
 
 	sent := p.getSent()
 	if len(sent) == 0 {
@@ -9786,7 +10574,7 @@ func TestCmdCompress_NoSession_RepliesNoSession(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 
 	msg := &Message{SessionKey: "test:user1", Content: "/compress", ReplyCtx: "ctx"}
-	e.cmdCompress(p, msg)
+	e.cmdCompress(p, msg, nil)
 
 	sent := p.getSent()
 	if len(sent) == 0 {
@@ -9871,7 +10659,7 @@ func TestCmdCompress_SessionBusy_RepliesPreviousProcessing(t *testing.T) {
 	}
 
 	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
-	e.cmdCompress(p, msg)
+	e.cmdCompress(p, msg, nil)
 
 	sent := p.getSent()
 	found := false
@@ -9904,7 +10692,7 @@ func TestCmdCompress_Success_SendsCompressDone(t *testing.T) {
 	e.interactiveMu.Unlock()
 
 	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
-	e.cmdCompress(p, msg)
+	e.cmdCompress(p, msg, nil)
 
 	// Wait for Send to be called (happens after drainEvents), then inject the result event.
 	deadline := time.After(3 * time.Second)
@@ -9962,7 +10750,7 @@ func TestCmdCompress_WithText_SendsResult(t *testing.T) {
 	e.interactiveMu.Unlock()
 
 	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
-	e.cmdCompress(p, msg)
+	e.cmdCompress(p, msg, nil)
 
 	// Wait for Send to be called (happens after drainEvents).
 	deadline := time.After(3 * time.Second)
@@ -10024,7 +10812,7 @@ func TestCmdCompress_DrainsQueueAfterSuccess(t *testing.T) {
 	e.interactiveMu.Unlock()
 
 	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
-	e.cmdCompress(p, msg)
+	e.cmdCompress(p, msg, nil)
 
 	// Complete compress.
 	sess.events <- Event{Type: EventResult, Content: "", Done: true}
@@ -11215,6 +12003,7 @@ func TestTruncateRunes(t *testing.T) {
 			t.Errorf("expected 4 runes (clamped), got %d (%q)", len(runes), got)
 		}
 	})
+
 }
 
 // --- runShellWithProgress tests ---
@@ -13903,6 +14692,34 @@ func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
 	}
 }
 
+func TestUnsolicitedReader_DoesNotEchoRemoteUserInputBackToIM(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("remote-input-no-echo")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("feishu:thread:user")
+	state := &interactiveState{
+		agentSession: sess, platform: p, replyCtx: "ctx", eventsNeedResync: false,
+	}
+	e.startUnsolicitedReader(state, session, sessions, "feishu:thread:user", "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventUserInput, Content: "hello from Feishu", InputOrigin: "remote"}
+	sess.events <- Event{Type: EventResult, Content: "answer", Done: true}
+
+	sent := waitForPlatformSend(p, 1, 5*time.Second)
+	for _, message := range sent {
+		if strings.Contains(message, "hello from Feishu") {
+			t.Fatalf("remote input was echoed back to IM: %v", sent)
+		}
+	}
+	if len(sent) == 0 || !strings.Contains(strings.Join(sent, "\n"), "answer") {
+		t.Fatalf("assistant output should still be mirrored: %v", sent)
+	}
+}
+
 // TestUnsolicitedReader_StopsOnCancel verifies that stopUnsolicitedReader
 // cleanly stops the reader goroutine and waits for it to exit.
 func TestUnsolicitedReader_StopsOnCancel(t *testing.T) {
@@ -13991,9 +14808,12 @@ func TestUnsolicitedReader_SetsResyncOnChannelClose(t *testing.T) {
 	}
 }
 
-// TestUnsolicitedReader_SetsResyncOnEventError verifies that EventError
-// sets eventsNeedResync to true and relays the error.
-func TestUnsolicitedReader_SetsResyncOnEventError(t *testing.T) {
+// TestUnsolicitedReader_ContinuesAfterRecoverableTurnError verifies that a
+// per-turn failure from a still-live Session Host is relayed without ending
+// the unsolicited reader. The reader owns route-lease renewal between IM
+// turns, so exiting here would make the bound thread report that its owning
+// terminal is unavailable even though the TUI is still alive.
+func TestUnsolicitedReader_ContinuesAfterRecoverableTurnError(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("unsol-error")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -14015,39 +14835,129 @@ func TestUnsolicitedReader_SetsResyncOnEventError(t *testing.T) {
 	doneCh := state.unsolicitedDone
 	state.mu.Unlock()
 
-	// Send an error event.
+	// Send one failed local-TUI turn, then a later successful local-TUI turn.
 	sess.events <- Event{Type: EventError, Error: errors.New("something broke")}
+	sess.events <- Event{Type: EventResult, Done: true}
+	sess.events <- Event{Type: EventUserInput, Content: "continue"}
+	sess.events <- Event{Type: EventText, Content: "recovered"}
+	sess.events <- Event{Type: EventResult, Content: "recovered", Done: true}
 
 	select {
 	case <-doneCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("unsolicited reader did not exit after EventError")
+		t.Fatal("recoverable EventError stopped the unsolicited reader")
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	state.mu.Lock()
 	resync := state.eventsNeedResync
 	state.mu.Unlock()
-	if !resync {
-		t.Error("expected eventsNeedResync=true after EventError")
+	if resync {
+		t.Error("recoverable EventError left eventsNeedResync=true")
 	}
 
-	// Verify error was relayed to platform.
+	// Verify both the failed turn and the later successful turn reached IM.
 	sent := p.getSent()
-	found := false
+	foundError := false
+	foundRecovery := false
 	for _, s := range sent {
 		if strings.Contains(s, "something broke") {
-			found = true
-			break
+			foundError = true
+		}
+		if strings.Contains(s, "recovered") {
+			foundRecovery = true
 		}
 	}
-	if !found {
-		t.Errorf("expected error to be relayed to platform, got %v", sent)
+	if !foundError || !foundRecovery {
+		t.Errorf("expected error and recovery to be relayed, got %v", sent)
 	}
 }
 
-// TestUnsolicitedReader_PermissionDeny verifies that unsolicited permission
-// requests are denied when approveAll is false.
-func TestUnsolicitedReader_PermissionDeny(t *testing.T) {
+// TestUnsolicitedReader_StopsAfterFatalSessionError preserves the fatal path:
+// EventError from a session that is no longer alive ends the reader and forces
+// the next owner to resynchronize buffered events.
+func TestUnsolicitedReader_StopsAfterFatalSessionError(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-fatal-error")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:fatal-error:u1")
+	state := &interactiveState{
+		agentSession: sess, platform: p, replyCtx: "ctx", eventsNeedResync: false,
+	}
+	e.startUnsolicitedReader(state, session, sessions, "test:fatal-error:u1", "")
+
+	state.mu.Lock()
+	doneCh := state.unsolicitedDone
+	state.mu.Unlock()
+	sess.alive = false
+	sess.events <- Event{Type: EventError, Error: errors.New("session link failed")}
+
+	select {
+	case <-doneCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fatal EventError did not stop the unsolicited reader")
+	}
+	state.mu.Lock()
+	resync := state.eventsNeedResync
+	state.mu.Unlock()
+	if !resync {
+		t.Error("fatal EventError must leave eventsNeedResync=true")
+	}
+}
+
+// TestUnsolicitedReader_RenewsRouteAfterRecoverableTurnError covers the exact
+// cross-process symptom: a sibling Feishu listener must still be able to route
+// the next message after the original lease duration has elapsed.
+func TestUnsolicitedReader_RenewsRouteAfterRecoverableTurnError(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-route-error")
+	e := NewEngine("project", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	router := NewSessionHostRouter(t.TempDir(), "project", "/tmp/cc-connect-test.sock")
+	router.lease = 60 * time.Millisecond
+	e.SetSessionHostRouter(router)
+	const sessionKey = "test:route-error:u1"
+	route, err := router.RegisterRoute(sessionKey)
+	if err != nil {
+		t.Fatalf("RegisterRoute() error = %v", err)
+	}
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive(sessionKey)
+	state := &interactiveState{
+		agentSession: sess, platform: p, replyCtx: "ctx", eventsNeedResync: false,
+		sessionHostRouteKey: sessionKey, sessionHostRouteGeneration: route.Generation,
+	}
+	e.startUnsolicitedReader(state, session, sessions, sessionKey, "")
+	state.mu.Lock()
+	doneCh := state.unsolicitedDone
+	state.mu.Unlock()
+
+	sess.events <- Event{Type: EventError, Error: errors.New("server_error")}
+	sess.events <- Event{Type: EventResult, Done: true}
+	time.Sleep(3 * router.lease)
+
+	select {
+	case <-doneCh:
+		t.Fatal("recoverable turn error stopped the route-renewing reader")
+	default:
+	}
+	current, err := router.Lookup(sessionKey)
+	if err != nil {
+		t.Fatalf("Lookup() error = %v", err)
+	}
+	if current == nil || !current.Alive(router.now()) {
+		t.Fatalf("route expired after recoverable turn error: %#v", current)
+	}
+}
+
+// TestUnsolicitedReader_PermissionUsesIMInteraction verifies that a permission
+// raised by a locally initiated host turn is rendered in IM and resolved by the
+// normal pending-permission path instead of being auto-denied.
+func TestUnsolicitedReader_PermissionUsesIMInteraction(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 	defer e.Stop()
@@ -14067,6 +14977,7 @@ func TestUnsolicitedReader_PermissionDeny(t *testing.T) {
 		eventsNeedResync: false,
 		approveAll:       false,
 	}
+	e.interactiveStates["test:perm:u1"] = state
 
 	e.startUnsolicitedReader(state, session, sessions, "test:perm:u1", "")
 
@@ -14075,33 +14986,499 @@ func TestUnsolicitedReader_PermissionDeny(t *testing.T) {
 		Type:      EventPermissionRequest,
 		RequestID: "req-1",
 		ToolName:  "Bash",
+		ToolInput: "rm generated.tmp",
+		ToolInputRaw: map[string]any{
+			"command": "rm generated.tmp",
+		},
 	}
 
-	// Wait for the response.
+	// Wait for the IM prompt, then answer it through the same route used by
+	// platform text/button callbacks.
 	deadline := time.After(5 * time.Second)
 	for {
-		permRecorder.mu.Lock()
-		calls := permRecorder.permCalls
-		permRecorder.mu.Unlock()
-		if calls > 0 {
+		state.mu.Lock()
+		pending := state.pending
+		state.mu.Unlock()
+		if pending != nil && len(p.getSent()) > 0 {
 			break
 		}
 		select {
 		case <-deadline:
-			t.Fatal("timed out waiting for permission response")
+			t.Fatal("timed out waiting for IM permission prompt")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if handled := e.handlePendingPermission(p, &Message{
+		SessionKey: "test:perm:u1", ReplyCtx: "ctx",
+	}, "allow", "test:perm:u1"); !handled {
+		t.Fatal("IM permission response was not handled")
+	}
+
+	permRecorder.mu.Lock()
+	calls := permRecorder.permCalls
+	result := permRecorder.lastPermResult
+	permRecorder.mu.Unlock()
+
+	if calls != 1 || result.Behavior != "allow" {
+		t.Errorf("permission response calls=%d behavior=%q, want one allow", calls, result.Behavior)
+	}
+	if result.UpdatedInput["command"] != "rm generated.tmp" {
+		t.Fatalf("updated input = %#v", result.UpdatedInput)
+	}
+
+	e.stopUnsolicitedReader(state)
+}
+
+func TestUnsolicitedReader_RelaysHostTurnContextBeforePermission(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangChinese)
+	defer e.Stop()
+	e.SetDisplayConfig(DisplayCfg{
+		Mode: "full", CardMode: "legacy", ThinkingMessages: true,
+		ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: true,
+	})
+
+	sess := newControllableSession("unsol-context")
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("feishu:context:u1")
+	state := &interactiveState{
+		agentSession: sess, platform: p, replyCtx: "ctx", eventsNeedResync: false,
+	}
+	e.startUnsolicitedReader(state, session, sessions, "feishu:context:u1", "/workspace/project")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventUserInput, Content: "检查下载目录", PermissionMode: "default"}
+	sess.events <- Event{Type: EventModel, Model: "claude-opus-4-6"}
+	sess.events <- Event{Type: EventThinking, Content: "先确认目录内容"}
+	sess.events <- Event{Type: EventText, Content: "我先查看 Downloads 目录。"}
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "find ~/Downloads -maxdepth 1"}
+	sess.events <- Event{
+		Type: EventPermissionRequest, RequestID: "req-context", ToolName: "Bash",
+		ToolInput: "find ~/Downloads -maxdepth 1", PermissionMode: "default",
+		DecisionReasonType: "rule", DecisionReasonDetail: "Bash(find:*)",
+		DestructiveWarning: "May expose private filenames", CustomMessage: "Review directory access",
+		ToolDescription: "Runs a shell command",
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		p.mu.Lock()
+		cardCount := len(p.sentCards)
+		p.mu.Unlock()
+		if cardCount > 0 && len(p.getSent()) >= 4 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for mirrored process/card, sent=%v", p.getSent())
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 
-	permRecorder.mu.Lock()
-	result := permRecorder.lastPermResult
-	permRecorder.mu.Unlock()
+	sent := p.getSent()
+	wantOrder := []string{"检查下载目录", "claude-opus-4-6", "先确认目录内容", "Downloads"}
+	for index, want := range wantOrder {
+		if index >= len(sent) || !strings.Contains(sent[index], want) {
+			t.Fatalf("sent[%d]=%q, want it to contain %q; all=%v", index, sent[index], want, sent)
+		}
+	}
+	p.mu.Lock()
+	card := p.sentCards[0]
+	p.mu.Unlock()
+	body := card.RenderText()
+	for _, want := range []string{
+		"检查下载目录", "claude-opus-4-6", "/workspace/project", "default",
+		"Bash(find:*)", "May expose private filenames", "Review directory access",
+		"Runs a shell command", "我先查看 Downloads 目录",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("permission card missing %q: %s", want, body)
+		}
+	}
+}
 
-	if result.Behavior != "deny" {
-		t.Errorf("expected deny, got %q", result.Behavior)
+func TestInteractionResolutionReaderClearsPendingWhenLocalUIWins(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	defer e.Stop()
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	resolved := make(chan InteractionResolution, 1)
+	presentation := e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "which claude")
+	pending := &pendingPermission{
+		RequestID: "req-local", Resolved: make(chan struct{}), cardPresentation: presentation,
+	}
+	state := &interactiveState{pending: pending}
+	source := &interactionResolutionTestSource{resolved: resolved}
+
+	go e.runInteractionResolutionReader(e.ctx, state, source)
+	resolved <- InteractionResolution{RequestID: "req-local", Behavior: "allow", Origin: "local"}
+
+	select {
+	case <-pending.Resolved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local resolution did not dismiss IM pending interaction")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.pending != nil {
+		t.Fatal("pending interaction remains after local UI response")
+	}
+	updated := waitForUpdatedCard(t, p)
+	if updated.Header == nil || updated.Header.Title != "✅ Allowed in terminal" || updated.Header.Color != "green" {
+		t.Fatalf("unexpected resolved card header: %+v", updated.Header)
+	}
+	if updated.HasButtons() {
+		t.Fatal("resolved permission card must not keep action buttons")
+	}
+	if !strings.Contains(updated.RenderText(), "which claude") {
+		t.Fatalf("resolved card lost original permission context: %s", updated.RenderText())
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.updateHandles) != 1 || p.updateHandles[0] != "card-1" {
+		t.Fatalf("unexpected update handles: %#v", p.updateHandles)
+	}
+}
+
+func TestStaleIMClickWaitsForAuthoritativeLocalResolution(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	defer e.Stop()
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	session := &permRecordingSession{
+		controllableAgentSession: *newControllableSession("race-session"),
+		permErr:                  ErrInteractionAlreadyResolved,
+	}
+	presentation := e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "pwd")
+	pending := &pendingPermission{
+		RequestID: "req-terminal-won", ToolInput: map[string]any{"command": "pwd"},
+		Resolved: make(chan struct{}), cardPresentation: presentation,
+	}
+	state := &interactiveState{agentSession: session, pending: pending}
+	e.interactiveStates["feishu:race"] = state
+	resolved := make(chan InteractionResolution, 1)
+	go e.runInteractionResolutionReader(e.ctx, state, &interactionResolutionTestSource{resolved: resolved})
+
+	if !e.handlePendingPermission(p, &Message{
+		SessionKey: "feishu:race", ReplyCtx: "ctx", IsPermissionResponse: true,
+	}, "allow", "feishu:race") {
+		t.Fatal("stale IM click was not consumed")
+	}
+	state.mu.Lock()
+	stillPending := state.pending == pending
+	state.mu.Unlock()
+	if !stillPending {
+		t.Fatal("stale IM click cleared pending before terminal resolution event arrived")
+	}
+	select {
+	case <-pending.Resolved:
+		t.Fatal("stale IM click resolved the interaction locally")
+	default:
 	}
 
-	e.stopUnsolicitedReader(state)
+	resolved <- InteractionResolution{
+		RequestID: "req-terminal-won", Behavior: "allow", Origin: "local",
+	}
+	select {
+	case <-pending.Resolved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("authoritative terminal resolution was not applied")
+	}
+	updated := waitForUpdatedCard(t, p)
+	if updated.Header == nil || updated.Header.Title != "✅ Allowed in terminal" || updated.HasButtons() {
+		t.Fatalf("stale card was not reconciled from terminal resolution: %+v", updated)
+	}
+}
+
+func waitForUpdatedCard(t *testing.T, p *stubTrackableCardPlatform) *Card {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		p.mu.Lock()
+		if len(p.updatedCards) > 0 {
+			card := p.updatedCards[len(p.updatedCards)-1]
+			p.mu.Unlock()
+			return card
+		}
+		p.mu.Unlock()
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for tracked card update")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func TestInteractionResolutionReaderUpdatesAskQuestionWithLocalAnswer(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangChinese)
+	defer e.Stop()
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	questions := testQuestions()
+	presentation := e.sendAskQuestionPrompt(p, "ctx", questions, 0)
+	pending := &pendingPermission{
+		RequestID: "req-ask-local", Questions: questions,
+		Resolved: make(chan struct{}), cardPresentation: presentation,
+	}
+	state := &interactiveState{pending: pending}
+	resolved := make(chan InteractionResolution, 1)
+	go e.runInteractionResolutionReader(e.ctx, state, &interactionResolutionTestSource{resolved: resolved})
+	resolved <- InteractionResolution{
+		RequestID: "req-ask-local", Behavior: "allow", Origin: "local",
+		UpdatedInput: map[string]any{"answers": map[string]any{
+			questions[0].Question: "PostgreSQL",
+		}},
+	}
+
+	select {
+	case <-pending.Resolved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local AskUserQuestion resolution did not dismiss IM pending interaction")
+	}
+	updated := waitForUpdatedCard(t, p)
+	if updated.HasButtons() {
+		t.Fatal("resolved AskUserQuestion card must not keep action buttons")
+	}
+	text := updated.RenderText()
+	if !strings.Contains(text, questions[0].Question) || !strings.Contains(text, "PostgreSQL") {
+		t.Fatalf("resolved AskUserQuestion card lost answer context: %s", text)
+	}
+}
+
+func TestInteractionResolutionReaderSummarizesAllLocalAskAnswers(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangChinese)
+	defer e.Stop()
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	questions := testMultiQuestions()
+	presentation := e.sendAskQuestionPrompt(p, "ctx", questions, 0)
+	pending := &pendingPermission{
+		RequestID: "req-ask-local-multi", Questions: questions,
+		Resolved: make(chan struct{}), cardPresentation: presentation,
+	}
+	state := &interactiveState{pending: pending}
+	resolved := make(chan InteractionResolution, 1)
+	go e.runInteractionResolutionReader(e.ctx, state, &interactionResolutionTestSource{resolved: resolved})
+	resolved <- InteractionResolution{
+		RequestID: "req-ask-local-multi", Behavior: "allow", Origin: "local",
+		UpdatedInput: map[string]any{"answers": map[string]any{
+			questions[0].Question: "PostgreSQL",
+			questions[1].Question: "Gin",
+		}},
+	}
+
+	select {
+	case <-pending.Resolved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local multi-question resolution did not dismiss IM pending interaction")
+	}
+	updated := waitForUpdatedCard(t, p)
+	if updated.HasButtons() {
+		t.Fatal("resolved multi-question card must not keep action buttons")
+	}
+	text := updated.RenderText()
+	for _, want := range []string{
+		questions[0].Question, "PostgreSQL", questions[1].Question, "Gin",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("resolved multi-question summary missing %q: %s", want, text)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sentCards) != 1 || len(p.updatedCards) != 1 {
+		t.Fatalf("terminal one-shot answer should update the original card in place: sent=%d updated=%d",
+			len(p.sentCards), len(p.updatedCards))
+	}
+}
+
+func TestAttachInteractionPresentationReconcilesResolutionBeforeSendReturns(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	defer e.Stop()
+	p := &stubTrackableCardPlatform{
+		stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+		sendCardStarted:  make(chan struct{}), sendCardRelease: make(chan struct{}),
+	}
+	pending := &pendingPermission{RequestID: "req-race", Resolved: make(chan struct{})}
+	state := &interactiveState{pending: pending}
+	resolved := make(chan InteractionResolution, 1)
+	go e.runInteractionResolutionReader(e.ctx, state, &interactionResolutionTestSource{resolved: resolved})
+
+	presentations := make(chan *interactionCardPresentation, 1)
+	go func() {
+		presentations <- e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "pwd")
+	}()
+	<-p.sendCardStarted
+	resolved <- InteractionResolution{RequestID: "req-race", Behavior: "allow", Origin: "local"}
+	select {
+	case <-pending.Resolved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolution was blocked by delayed card send")
+	}
+	close(p.sendCardRelease)
+	e.attachInteractionCardPresentation(state, pending, <-presentations)
+	updated := waitForUpdatedCard(t, p)
+	if updated.Header == nil || updated.Header.Title != "✅ Allowed in terminal" {
+		t.Fatalf("late card handle was not reconciled: %+v", updated.Header)
+	}
+}
+
+func TestInteractionCardUpdateFailureDoesNotBlockResolution(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	defer e.Stop()
+	p := &stubTrackableCardPlatform{
+		stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+		updateCardErr:    errors.New("patch unavailable"),
+	}
+	presentation := e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "pwd")
+	pending := &pendingPermission{
+		RequestID: "req-update-fail", Resolved: make(chan struct{}), cardPresentation: presentation,
+	}
+	state := &interactiveState{pending: pending}
+	resolved := make(chan InteractionResolution, 1)
+	go e.runInteractionResolutionReader(e.ctx, state, &interactionResolutionTestSource{resolved: resolved})
+	resolved <- InteractionResolution{RequestID: "req-update-fail", Behavior: "allow", Origin: "local"}
+
+	select {
+	case <-pending.Resolved:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("card update failure blocked native interaction resolution")
+	}
+}
+
+func TestInteractionCardUpdaterWaitsForCapacityInsteadOfDroppingFinalState(t *testing.T) {
+	u := newInteractionCardUpdater()
+	defer u.stop(10 * time.Second)
+	sender := &saturatingTrackableCardSender{
+		started: make(chan struct{}, 4),
+		release: make(chan struct{}),
+	}
+	card := NewCard().Title("done", "green").Build()
+
+	// Occupy all workers, then fill every buffered slot.
+	for i := 0; i < 4; i++ {
+		if !u.enqueue(interactionCardUpdate{sender: sender, handle: i, card: card}) {
+			t.Fatal("failed to occupy interaction card update worker")
+		}
+	}
+	for i := 0; i < 4; i++ {
+		select {
+		case <-sender.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("interaction card update worker did not start")
+		}
+	}
+	for i := 0; i < interactionCardUpdateQueueSize; i++ {
+		if !u.enqueue(interactionCardUpdate{sender: sender, handle: i + 4, card: card}) {
+			t.Fatalf("failed to fill interaction card update queue at %d", i)
+		}
+	}
+
+	accepted := make(chan bool, 1)
+	go func() {
+		accepted <- u.enqueueWait(interactionCardUpdate{
+			sender: sender, handle: "final-resolution", card: card,
+		})
+	}()
+	select {
+	case result := <-accepted:
+		t.Fatalf("final update returned before capacity became available: %v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sender.release)
+	select {
+	case result := <-accepted:
+		if !result {
+			t.Fatal("final resolved card was dropped after queue saturation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("final resolved card was not accepted after capacity became available")
+	}
+}
+
+func TestEngineStopDrainsAcceptedInteractionCardUpdate(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	p := &stubTrackableCardPlatform{
+		stubCardPlatform:  stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+		updateCardStarted: make(chan struct{}), updateCardRelease: make(chan struct{}),
+	}
+	presentation := &interactionCardPresentation{sender: p, handle: "card-stop", body: "context"}
+	e.updateInteractionCard(presentation, NewCard().Title("done", "green").Build())
+
+	select {
+	case <-p.updateCardStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interaction card update did not start")
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.Stop() }()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Engine.Stop returned before accepted card update completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(p.updateCardRelease)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Engine.Stop failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Stop did not finish after card update completed")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.updatedCards) != 1 || p.updateHandles[0] != "card-stop" {
+		t.Fatalf("accepted card update was not drained: handles=%#v cards=%d",
+			p.updateHandles, len(p.updatedCards))
+	}
+}
+
+func TestEngineStopDrainsInFlightTerminalResolutionBeforeCardUpdater(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	p := &stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}}
+	presentation := e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "pwd")
+	pending := &pendingPermission{
+		RequestID: "req-exit-race", Resolved: make(chan struct{}), cardPresentation: presentation,
+	}
+	state := &interactiveState{pending: pending}
+	resolved := make(chan InteractionResolution, 1)
+	e.startInteractionResolutionReader(state, &interactionResolutionTestSource{resolved: resolved})
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.Stop() }()
+	time.Sleep(20 * time.Millisecond)
+	resolved <- InteractionResolution{
+		RequestID: "req-exit-race", Behavior: "allow", Origin: "local",
+	}
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Engine.Stop failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Engine.Stop did not finish after draining terminal resolution")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.updatedCards) != 1 || p.updatedCards[0].HasButtons() {
+		t.Fatalf("in-flight terminal resolution did not close the IM card: cards=%d",
+			len(p.updatedCards))
+	}
+}
+
+type interactionResolutionTestSource struct {
+	resolved chan InteractionResolution
+}
+
+func (s *interactionResolutionTestSource) InteractionResolutions() <-chan InteractionResolution {
+	return s.resolved
 }
 
 // permRecordingSession wraps controllableAgentSession and records permission responses.
@@ -14110,6 +15487,7 @@ type permRecordingSession struct {
 	mu             sync.Mutex
 	permCalls      int
 	lastPermResult PermissionResult
+	permErr        error
 }
 
 func (s *permRecordingSession) RespondPermission(_ string, res PermissionResult) error {
@@ -14117,7 +15495,7 @@ func (s *permRecordingSession) RespondPermission(_ string, res PermissionResult)
 	s.permCalls++
 	s.lastPermResult = res
 	s.mu.Unlock()
-	return nil
+	return s.permErr
 }
 
 // TestEventsNeedResync_DefaultTrue verifies that new interactiveState
@@ -14175,6 +15553,36 @@ func TestEventsNeedResync_ClearedOnCleanResult(t *testing.T) {
 
 	if resync {
 		t.Error("expected eventsNeedResync to be false after clean EventResult")
+	}
+}
+
+func TestFormatHostUserInputFollowsConfiguredLanguage(t *testing.T) {
+	tests := []struct {
+		lang Language
+		want string
+	}{
+		{LangEnglish, "💬 **TUI input**\n\nhello"},
+		{LangChinese, "💬 **TUI 输入**\n\nhello"},
+		{LangTraditionalChinese, "💬 **TUI 輸入**\n\nhello"},
+		{LangJapanese, "💬 **TUI 入力**\n\nhello"},
+		{LangSpanish, "💬 **Entrada de TUI**\n\nhello"},
+	}
+	for _, tt := range tests {
+		if got := formatHostUserInput("hello", tt.lang); got != tt.want {
+			t.Fatalf("formatHostUserInput(%q) = %q, want %q", tt.lang, got, tt.want)
+		}
+	}
+}
+
+func TestPermissionCardTUIInputLabelFollowsConfiguredLanguage(t *testing.T) {
+	e := NewEngine("test", &stubAgent{}, nil, "", LangChinese)
+	defer e.Stop()
+	body := e.permissionCardBody("Bash", "pwd", PermissionPromptContext{UserInput: "检查状态"})
+	if !strings.Contains(body, "**TUI 输入:**") {
+		t.Fatalf("localized TUI input label missing: %q", body)
+	}
+	if strings.Contains(body, "**TUI input:**") {
+		t.Fatalf("English TUI input label leaked into Chinese card: %q", body)
 	}
 }
 
@@ -15427,6 +16835,44 @@ func TestHandlePendingPermission_StalePermissionCallback_Dropped(t *testing.T) {
 		}
 		if rec.lastResult.Behavior != "allow" {
 			t.Fatalf("RespondPermission behavior = %q, want allow", rec.lastResult.Behavior)
+		}
+	})
+
+	t.Run("old interaction card cannot resolve a newer pending request", func(t *testing.T) {
+		iKey := "ws:sk-stale-request-id"
+		pending := &pendingPermission{
+			RequestID: "req-current", ToolName: "Bash",
+			ToolInput: map[string]any{"command": "pwd"}, Resolved: make(chan struct{}),
+		}
+		e.interactiveMu.Lock()
+		e.interactiveStates[iKey] = &interactiveState{agentSession: rec, pending: pending}
+		e.interactiveMu.Unlock()
+		before := rec.calls
+
+		msg := &Message{
+			SessionKey: "sk-stale-request-id", Content: "allow",
+			IsPermissionResponse: true, IsInteractionResponse: true,
+			InteractionRequestID: "req-old",
+		}
+		if !e.handlePendingPermission(p, msg, "allow", iKey) {
+			t.Fatal("stale request-specific callback must be consumed")
+		}
+		if rec.calls != before {
+			t.Fatalf("RespondPermission calls = %d, want unchanged %d", rec.calls, before)
+		}
+		state, stillPending := e.lookupPending(iKey)
+		if state == nil || stillPending != pending {
+			t.Fatal("stale callback replaced or cleared the current pending request")
+		}
+	})
+
+	t.Run("stale AskUserQuestion callback with no state is consumed", func(t *testing.T) {
+		msg := &Message{
+			SessionKey: "sk-stale-ask", Content: "askq:req-old:0:1",
+			IsInteractionResponse: true, InteractionRequestID: "req-old",
+		}
+		if !e.handlePendingPermission(p, msg, msg.Content, "missing-ask-state") {
+			t.Fatal("stale AskUserQuestion callback must not fall through as a user prompt")
 		}
 	})
 }

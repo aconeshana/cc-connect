@@ -18,6 +18,10 @@ type Platform interface {
 // ErrNotSupported indicates a platform doesn't support a particular operation.
 var ErrNotSupported = errors.New("operation not supported by this platform")
 
+// ErrInteractionAlreadyResolved indicates that another surface won the race
+// to answer a native permission or AskUserQuestion interaction.
+var ErrInteractionAlreadyResolved = errors.New("interaction already resolved")
+
 // ReplyContextReconstructor is an optional interface for platforms that can
 // recreate a reply context from a session key. This is needed for cron jobs
 // to send messages to users without an incoming message.
@@ -349,6 +353,15 @@ type CardSender interface {
 	ReplyCard(ctx context.Context, replyCtx any, card *Card) error
 }
 
+// TrackableCardSender is an optional CardSender extension for workflows that
+// must update the exact card they just sent without waiting for a card action
+// callback. The returned handle is platform-private and is only passed back to
+// UpdateCard.
+type TrackableCardSender interface {
+	SendCardWithHandle(ctx context.Context, replyCtx any, card *Card) (any, error)
+	UpdateCard(ctx context.Context, handle any, card *Card) error
+}
+
 // CardNavigationHandler is called by platforms to render a card for in-place
 // card updates (e.g. Feishu card.action.trigger callback). The action string
 // uses prefixes like "nav:/model" or "act:/model 3".
@@ -485,6 +498,35 @@ type ModelSwitcher interface {
 	AvailableModels(ctx context.Context) []ModelOption
 }
 
+// SessionModelSwitcher is an optional interface for semantic session hosts
+// whose model selection belongs to an already-running application session.
+// Unlike ModelSwitcher, a successful change must take effect in the addressed
+// session without restarting or detaching it.
+type SessionModelSwitcher interface {
+	GetSessionModel(ctx context.Context, sessionID string) (SessionModelState, error)
+	SetSessionModel(ctx context.Context, sessionID, model string) (SessionModelState, error)
+}
+
+// SessionModelState is an authoritative model snapshot for one running agent
+// session. Models contains the choices currently accepted by SetSessionModel.
+type SessionModelState struct {
+	Current string
+	Models  []ModelOption
+}
+
+// SessionReasoningEffortSwitcher changes effort on an already-running,
+// application-owned session without restarting it or clearing its transcript.
+type SessionReasoningEffortSwitcher interface {
+	GetSessionReasoningEffort(ctx context.Context, sessionID string) (SessionReasoningEffortState, error)
+	SetSessionReasoningEffort(ctx context.Context, sessionID, effort string) (SessionReasoningEffortState, error)
+}
+
+type SessionReasoningEffortState struct {
+	Current   string
+	Effective string
+	Efforts   []string
+}
+
 // ReasoningEffortSwitcher is an optional interface for agents that support
 // runtime switching of reasoning effort.
 type ReasoningEffortSwitcher interface {
@@ -571,6 +613,17 @@ type ContextUsage struct {
 // that will be forwarded to the agent process. Return "" if not supported.
 type ContextCompressor interface {
 	CompressCommand() string
+}
+
+// SessionContextCompactor compacts one specifically addressed live session.
+// Session Host implementations use this instead of forwarding a slash string
+// through the ordinary model-visible turn submission path.
+type SessionContextCompactor interface {
+	CompactSession(ctx context.Context, sessionID, instructions string) (SessionCompactionResult, error)
+}
+
+type SessionCompactionResult struct {
+	Message string
 }
 
 // AgentSessionCanceller is an optional interface for agent sessions that support

@@ -47,7 +47,7 @@ type progressPlatform struct {
 type Platform struct {
 	token                      string
 	allowFrom                  string
-	guildID                    string   // optional: per-guild registration (instant) vs global (up to 1h propagation)
+	guildID                    string // optional: per-guild registration (instant) vs global (up to 1h propagation)
 	progressStyle              string
 	groupReplyAllGuilds        []string // guild IDs where groupReplyAll is active; "*" = all guilds
 	shareSessionInChannel      bool
@@ -848,7 +848,7 @@ func (p *Platform) handleInteraction(s *discordgo.Session, i *discordgo.Interact
 		MessageID: i.ID,
 		ChannelID: i.ChannelID,
 		UserID:    userID, UserName: userName,
-		Content:  cmdText, ReplyCtx: rctx,
+		Content: cmdText, ReplyCtx: rctx,
 	}
 	msg.ChatName, _ = p.ResolveChannelName(channelID)
 	p.dispatchMessage(msg)
@@ -888,12 +888,38 @@ func reconstructCommand(data discordgo.ApplicationCommandInteractionData) string
 
 func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, userID, userName string) {
 	data := i.MessageComponentData()
-	if !strings.HasPrefix(data.CustomID, "cmd:") {
+	requestID := ""
+	content := ""
+	isPermission := false
+	isInteraction := false
+	choiceLabel := data.CustomID
+	switch {
+	case strings.HasPrefix(data.CustomID, "cmd:"):
+		content = strings.TrimPrefix(data.CustomID, "cmd:")
+	case strings.HasPrefix(data.CustomID, "perm:"):
+		var decision string
+		var ok bool
+		requestID, decision, ok = core.ParsePermissionAction(data.CustomID)
+		if !ok {
+			return
+		}
+		content = map[string]string{"allow": "allow", "deny": "deny", "allow_all": "allow all"}[decision]
+		choiceLabel = content
+		isPermission = true
+		isInteraction = true
+	case strings.HasPrefix(data.CustomID, "askq:"):
+		var ok bool
+		requestID, _, _, ok = core.ParseAskQuestionAction(data.CustomID)
+		if !ok {
+			return
+		}
+		content = data.CustomID
+		isInteraction = true
+	default:
 		slog.Debug("discord: unknown component interaction", "custom_id", data.CustomID)
 		return
 	}
 
-	command := strings.TrimPrefix(data.CustomID, "cmd:")
 	origText := ""
 	if i.Message != nil {
 		origText = i.Message.Content
@@ -902,7 +928,7 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
-			Content:    origText + "\n\n> " + command,
+			Content:    origText + "\n\n> " + choiceLabel,
 			Components: emptyComponents,
 		},
 	}); err != nil {
@@ -922,15 +948,10 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 	}
 	chatName, _ := p.ResolveChannelName(channelID)
 	p.dispatchMessage(&core.Message{
-		SessionKey: sessionKey,
-		ChannelKey: channelKey,
-		Platform:   "discord",
-		MessageID:  i.ID,
-		UserID:     userID,
-		UserName:   userName,
-		Content:    command,
-		ChatName:   chatName,
-		ReplyCtx:   rc,
+		SessionKey: sessionKey, ChannelKey: channelKey, Platform: "discord",
+		MessageID: i.ID, UserID: userID, UserName: userName, Content: content,
+		ChatName: chatName, ReplyCtx: rc, IsPermissionResponse: isPermission,
+		IsInteractionResponse: isInteraction, InteractionRequestID: requestID,
 	})
 }
 
@@ -1191,6 +1212,8 @@ func (p *progressPlatform) ProgressUpdateInterval() time.Duration {
 var _ core.ImageSender = (*Platform)(nil)
 var _ core.FileSender = (*Platform)(nil)
 var _ core.InlineButtonSender = (*Platform)(nil)
+var _ core.SessionThreadBinder = (*Platform)(nil)
+var _ core.FreshSessionThreadBinder = (*Platform)(nil)
 var _ core.ProgressStyleProvider = (*progressPlatform)(nil)
 var _ core.ProgressCardPayloadSupport = (*progressPlatform)(nil)
 var _ core.ProgressUpdateThrottler = (*progressPlatform)(nil)
@@ -1206,6 +1229,53 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		rc.threadID = parts[1]
 	}
 	return rc, nil
+}
+
+// BindSessionThread implements core.SessionThreadBinder for application-owned
+// sessions. Existing thread keys are restored in place; channel/user keys
+// create a fresh standalone thread through Discord's native thread API.
+func (p *Platform) BindSessionThread(
+	ctx context.Context, baseSessionKey, sessionID, title string,
+) (string, any, error) {
+	_ = ctx
+	if !p.threadIsolation {
+		return "", nil, core.ErrNotSupported
+	}
+	if strings.TrimSpace(baseSessionKey) == "" {
+		return "", nil, fmt.Errorf("discord: empty host session key")
+	}
+	channelID, err := parseDiscordSessionKeyChannelID(baseSessionKey)
+	if err != nil {
+		return "", nil, err
+	}
+	channel, err := p.session.Channel(channelID)
+	if err != nil {
+		return "", nil, fmt.Errorf("discord: resolve host channel %s: %w", channelID, err)
+	}
+	if isThreadChannelType(channel.Type) {
+		if err := p.session.ThreadJoin(channelID); err != nil {
+			slog.Debug("discord: join bound host thread failed", "thread", channelID, "error", err)
+		}
+		return buildThreadSessionKey(channelID),
+			replyContext{channelID: channelID, threadID: channelID}, nil
+	}
+	threadTitle := strings.TrimSpace(title)
+	if threadTitle == "" && strings.TrimSpace(sessionID) != "" {
+		threadTitle = "Claude Code · " + strings.TrimSpace(sessionID)
+	}
+	return resolveCronReplyTarget(baseSessionKey, threadTitle,
+		sessionThreadOps{session: p.session})
+}
+
+func (p *Platform) CreateSessionThread(
+	ctx context.Context, baseSessionKey, title string,
+) (string, any, error) {
+	_ = ctx
+	if !p.threadIsolation {
+		return "", nil, core.ErrNotSupported
+	}
+	return resolveCronReplyTarget(baseSessionKey, title,
+		sessionThreadOps{session: p.session})
 }
 
 func (p *Platform) ResolveCronReplyTarget(sessionKey string, title string) (string, any, error) {

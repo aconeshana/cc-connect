@@ -52,6 +52,46 @@ func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core
 	return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
 }
 
+// SendCardWithHandle sends a card and returns a private handle that can update
+// this exact message later, even when no card action callback has occurred.
+func (p *interactivePlatform) SendCardWithHandle(ctx context.Context, rctx any, card *core.Card) (any, error) {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return nil, fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	if rc.chatID == "" {
+		return nil, fmt.Errorf("%s: chatID is empty, cannot send card", p.tag())
+	}
+	cardJSON := renderCard(card, rc.sessionKey)
+	var (
+		messageID string
+		err       error
+	)
+	if !p.noReplyToTrigger && p.shouldReplyInThread(rc) {
+		messageID, err = p.replyMessageWithID(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+	} else {
+		messageID, err = p.createMessageWithID(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &feishuTrackedCardHandle{messageID: messageID, sessionKey: rc.sessionKey}, nil
+}
+
+// UpdateCard replaces a card previously returned by SendCardWithHandle.
+func (p *interactivePlatform) UpdateCard(ctx context.Context, handle any, card *core.Card) error {
+	h, ok := handle.(*feishuTrackedCardHandle)
+	if !ok {
+		return fmt.Errorf("%s: invalid tracked card handle type %T", p.tag(), handle)
+	}
+	return p.patchCardMessage(ctx, h.messageID, renderCard(card, h.sessionKey))
+}
+
+type feishuTrackedCardHandle struct {
+	messageID  string
+	sessionKey string
+}
+
 // RefreshCard updates a previously rendered card in-place using the Patch API.
 // It looks up the messageID stored from the most recent card action callback
 // for the given session key and patches that message with the new card content.

@@ -219,6 +219,21 @@ const (
 	MsgListPageHint              MsgKey = "list_page_hint"
 	MsgListSwitchHint            MsgKey = "list_switch_hint"
 	MsgListError                 MsgKey = "list_error"
+	MsgResume                    MsgKey = "resume"
+	MsgResumeCardTitle           MsgKey = "resume_card_title"
+	MsgResumeCardTitlePaged      MsgKey = "resume_card_title_paged"
+	MsgResumeCardTitleShort      MsgKey = "resume_card_title_short"
+	MsgResumePageHint            MsgKey = "resume_page_hint"
+	MsgResumeNotSupported        MsgKey = "resume_not_supported"
+	MsgResumeSwitchDisabled      MsgKey = "resume_switch_disabled"
+	MsgResumeLoading             MsgKey = "resume_loading"
+	MsgResumeSuccess             MsgKey = "resume_success"
+	MsgResumeAlreadyActive       MsgKey = "resume_already_active"
+	MsgResumeFailed              MsgKey = "resume_failed"
+	MsgResumeBusy                MsgKey = "resume_busy"
+	MsgResumeNoMatch             MsgKey = "resume_no_match"
+	MsgResumeTerminalNotice      MsgKey = "resume_terminal_notice"
+	MsgTUIInputLabel             MsgKey = "tui_input_label"
 	MsgHistoryEmpty              MsgKey = "history_empty"
 	MsgNameUsage                 MsgKey = "name_usage"
 	MsgNameSet                   MsgKey = "name_set"
@@ -295,18 +310,21 @@ const (
 	MsgCronBtnUnmute          MsgKey = "cron_btn_unmute"
 	MsgCronBtnDelete          MsgKey = "cron_btn_delete"
 
-	MsgStatusTitle           MsgKey = "status_title"
-	MsgReplyFooterRemaining  MsgKey = "reply_footer_remaining"
-	MsgModelCurrent          MsgKey = "model_current"
-	MsgModelChanged          MsgKey = "model_changed"
-	MsgModelChangeFailed     MsgKey = "model_change_failed"
-	MsgModelCardSwitching    MsgKey = "model_card_switching"
-	MsgModelCardSwitched     MsgKey = "model_card_switched"
-	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
-	MsgModelNotSupported     MsgKey = "model_not_supported"
-	MsgReasoningCurrent      MsgKey = "reasoning_current"
-	MsgReasoningChanged      MsgKey = "reasoning_changed"
-	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
+	MsgStatusTitle                MsgKey = "status_title"
+	MsgReplyFooterRemaining       MsgKey = "reply_footer_remaining"
+	MsgModelCurrent               MsgKey = "model_current"
+	MsgModelChanged               MsgKey = "model_changed"
+	MsgModelChangeFailed          MsgKey = "model_change_failed"
+	MsgModelCardSwitching         MsgKey = "model_card_switching"
+	MsgModelCardSwitched          MsgKey = "model_card_switched"
+	MsgModelCardSwitchFailed      MsgKey = "model_card_switch_failed"
+	MsgModelNotSupported          MsgKey = "model_not_supported"
+	MsgReasoningCurrent           MsgKey = "reasoning_current"
+	MsgReasoningChanged           MsgKey = "reasoning_changed"
+	MsgReasoningChangedLive       MsgKey = "reasoning_changed_live"
+	MsgReasoningNotSupported      MsgKey = "reasoning_not_supported"
+	MsgReasoningCardChangeFailed  MsgKey = "reasoning_card_change_failed"
+	MsgCardActionOwnerUnavailable MsgKey = "card_action_owner_unavailable"
 
 	MsgCompressNotSupported MsgKey = "compress_not_supported"
 	MsgCompressing          MsgKey = "compressing"
@@ -378,49 +396,57 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
 	MsgCronLastRunLabel  MsgKey = "cron_last_run_label"
 
-	MsgPermBtnAllow    MsgKey = "perm_btn_allow"
-	MsgPermBtnDeny     MsgKey = "perm_btn_deny"
-	MsgPermBtnAllowAll MsgKey = "perm_btn_allow_all"
-	MsgPermCardTitle   MsgKey = "perm_card_title"
-	MsgPermCardBody    MsgKey = "perm_card_body"
-	MsgPermCardNote    MsgKey = "perm_card_note"
+	MsgPermBtnAllow           MsgKey = "perm_btn_allow"
+	MsgPermBtnDeny            MsgKey = "perm_btn_deny"
+	MsgPermBtnAllowAll        MsgKey = "perm_btn_allow_all"
+	MsgPermCardTitle          MsgKey = "perm_card_title"
+	MsgPermCardBody           MsgKey = "perm_card_body"
+	MsgPermCardNote           MsgKey = "perm_card_note"
+	MsgPermResolvedLocalAllow MsgKey = "perm_resolved_local_allow"
+	MsgPermResolvedLocalDeny  MsgKey = "perm_resolved_local_deny"
 
-	MsgAskQuestionTitle     MsgKey = "ask_question_title"
-	MsgAskQuestionNote      MsgKey = "ask_question_note"
-	MsgAskQuestionNoteMulti MsgKey = "ask_question_note_multi"
-	MsgAskQuestionMulti     MsgKey = "ask_question_multi"
-	MsgAskQuestionPrompt    MsgKey = "ask_question_prompt"
-	MsgAskQuestionAnswered  MsgKey = "ask_question_answered"
+	MsgAskQuestionTitle              MsgKey = "ask_question_title"
+	MsgAskQuestionNote               MsgKey = "ask_question_note"
+	MsgAskQuestionNoteMulti          MsgKey = "ask_question_note_multi"
+	MsgAskQuestionMulti              MsgKey = "ask_question_multi"
+	MsgAskQuestionOther              MsgKey = "ask_question_other"
+	MsgAskQuestionOtherButton        MsgKey = "ask_question_other_button"
+	MsgAskQuestionCustomTitle        MsgKey = "ask_question_custom_title"
+	MsgAskQuestionCustomPrompt       MsgKey = "ask_question_custom_prompt"
+	MsgAskQuestionCustomNote         MsgKey = "ask_question_custom_note"
+	MsgAskQuestionPrompt             MsgKey = "ask_question_prompt"
+	MsgAskQuestionAnswered           MsgKey = "ask_question_answered"
+	MsgAskQuestionNoStructuredAnswer MsgKey = "ask_question_no_structured_answer"
 
 	MsgCommandsTitle        MsgKey = "commands_title"
 	MsgCommandsEmpty        MsgKey = "commands_empty"
@@ -1443,6 +1469,111 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "❌ セッション一覧の取得に失敗しました: %v",
 		LangSpanish:            "❌ Error al listar sesiones: %v",
 	},
+	MsgResume: {
+		LangEnglish:            "Resume a terminal session in this thread",
+		LangChinese:            "在当前话题中恢复终端会话",
+		LangTraditionalChinese: "在目前話題中恢復終端會話",
+		LangJapanese:           "このスレッドで端末セッションを再開",
+		LangSpanish:            "Reanudar una sesión del terminal en este hilo",
+	},
+	MsgResumeCardTitle: {
+		LangEnglish:            "Resume terminal session (%d)",
+		LangChinese:            "恢复终端会话（%d）",
+		LangTraditionalChinese: "恢復終端會話（%d）",
+		LangJapanese:           "端末セッションを再開（%d）",
+		LangSpanish:            "Reanudar sesión del terminal (%d)",
+	},
+	MsgResumeCardTitlePaged: {
+		LangEnglish:            "Resume terminal session (%d) · Page %d/%d",
+		LangChinese:            "恢复终端会话（%d）· 第 %d/%d 页",
+		LangTraditionalChinese: "恢復終端會話（%d）· 第 %d/%d 頁",
+		LangJapanese:           "端末セッションを再開（%d）· %d/%d ページ",
+		LangSpanish:            "Reanudar sesión del terminal (%d) · Página %d/%d",
+	},
+	MsgResumeCardTitleShort: {
+		LangEnglish:            "Resume session",
+		LangChinese:            "恢复会话",
+		LangTraditionalChinese: "恢復會話",
+		LangJapanese:           "セッション再開",
+		LangSpanish:            "Reanudar sesión",
+	},
+	MsgResumePageHint: {
+		LangEnglish:            "Page %d/%d",
+		LangChinese:            "第 %d/%d 页",
+		LangTraditionalChinese: "第 %d/%d 頁",
+		LangJapanese:           "%d/%d ページ",
+		LangSpanish:            "Página %d/%d",
+	},
+	MsgResumeNotSupported: {
+		LangEnglish:            "The current Agent does not support terminal session resume.",
+		LangChinese:            "当前 Agent 不支持恢复终端会话。",
+		LangTraditionalChinese: "目前 Agent 不支援恢復終端會話。",
+		LangJapanese:           "現在の Agent は端末セッションの再開に対応していません。",
+		LangSpanish:            "El Agent actual no admite reanudar sesiones del terminal.",
+	},
+	MsgResumeSwitchDisabled: {
+		LangEnglish:            "Session Host uses `/resume`; `/switch` is disabled for this thread.",
+		LangChinese:            "Session Host 请使用 `/resume`；当前话题已禁用 `/switch`。",
+		LangTraditionalChinese: "Session Host 請使用 `/resume`；目前話題已停用 `/switch`。",
+		LangJapanese:           "Session Host では `/resume` を使用してください。このスレッドでは `/switch` は無効です。",
+		LangSpanish:            "Session Host usa `/resume`; `/switch` está deshabilitado en este hilo.",
+	},
+	MsgResumeLoading: {
+		LangEnglish:            "Switching the terminal and this thread…",
+		LangChinese:            "正在切换终端和当前话题…",
+		LangTraditionalChinese: "正在切換終端和目前話題…",
+		LangJapanese:           "端末とこのスレッドを切り替えています…",
+		LangSpanish:            "Cambiando el terminal y este hilo…",
+	},
+	MsgResumeSuccess: {
+		LangEnglish:            "✅ Resumed `%s` · %d messages loaded",
+		LangChinese:            "✅ 已恢复 `%s` · 已加载 %d 条消息",
+		LangTraditionalChinese: "✅ 已恢復 `%s` · 已載入 %d 則訊息",
+		LangJapanese:           "✅ `%s` を再開 · %d 件のメッセージを読み込みました",
+		LangSpanish:            "✅ Reanudada `%s` · %d mensajes cargados",
+	},
+	MsgResumeAlreadyActive: {
+		LangEnglish:            "✅ `%s` is already active in this thread",
+		LangChinese:            "✅ `%s` 已经是当前话题的活动会话",
+		LangTraditionalChinese: "✅ `%s` 已經是目前話題的活動會話",
+		LangJapanese:           "✅ `%s` はすでにこのスレッドで有効です",
+		LangSpanish:            "✅ `%s` ya está activa en este hilo",
+	},
+	MsgResumeFailed: {
+		LangEnglish:            "❌ Resume failed: %v",
+		LangChinese:            "❌ 恢复失败：%v",
+		LangTraditionalChinese: "❌ 恢復失敗：%v",
+		LangJapanese:           "❌ 再開に失敗しました: %v",
+		LangSpanish:            "❌ Error al reanudar: %v",
+	},
+	MsgResumeBusy: {
+		LangEnglish:            "The current terminal turn is still running. Retry after it finishes.",
+		LangChinese:            "当前终端回合仍在运行，请在结束后重试。",
+		LangTraditionalChinese: "目前終端回合仍在執行，請在結束後重試。",
+		LangJapanese:           "現在の端末ターンが実行中です。完了後に再試行してください。",
+		LangSpanish:            "El turno actual del terminal sigue en ejecución. Reinténtalo al finalizar.",
+	},
+	MsgResumeNoMatch: {
+		LangEnglish:            "No terminal session matches %q.",
+		LangChinese:            "没有找到匹配 %q 的终端会话。",
+		LangTraditionalChinese: "找不到符合 %q 的終端會話。",
+		LangJapanese:           "%q に一致する端末セッションがありません。",
+		LangSpanish:            "Ninguna sesión del terminal coincide con %q.",
+	},
+	MsgResumeTerminalNotice: {
+		LangEnglish:            "↩ Resumed in TUI · %s · %d messages loaded",
+		LangChinese:            "↩ 已在 TUI 恢复 · %s · 已加载 %d 条消息",
+		LangTraditionalChinese: "↩ 已在 TUI 恢復 · %s · 已載入 %d 則訊息",
+		LangJapanese:           "↩ TUI で再開 · %s · %d 件のメッセージを読み込みました",
+		LangSpanish:            "↩ Reanudada en TUI · %s · %d mensajes cargados",
+	},
+	MsgTUIInputLabel: {
+		LangEnglish:            "TUI input",
+		LangChinese:            "TUI 输入",
+		LangTraditionalChinese: "TUI 輸入",
+		LangJapanese:           "TUI 入力",
+		LangSpanish:            "Entrada de TUI",
+	},
 	MsgHistoryEmpty: {
 		LangEnglish:            "No history in current session.",
 		LangChinese:            "当前会话暂无历史消息。",
@@ -2257,12 +2388,33 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "推論強度を `%s` に切り替えました。新しいセッションで使用されます。",
 		LangSpanish:            "Esfuerzo de razonamiento cambiado a `%s`. Las nuevas sesiones usarán esta configuración.",
 	},
+	MsgReasoningChangedLive: {
+		LangEnglish:            "Reasoning effort switched to `%s` for this session.",
+		LangChinese:            "当前会话的推理强度已切换为 `%s`。",
+		LangTraditionalChinese: "目前會話的推理強度已切換為 `%s`。",
+		LangJapanese:           "このセッションの推論強度を `%s` に切り替えました。",
+		LangSpanish:            "Esfuerzo de razonamiento cambiado a `%s` para esta sesión.",
+	},
 	MsgReasoningNotSupported: {
 		LangEnglish:            "This agent does not support reasoning effort switching.",
 		LangChinese:            "当前 Agent 不支持推理强度切换。",
 		LangTraditionalChinese: "當前 Agent 不支援推理強度切換。",
 		LangJapanese:           "このエージェントは推論強度の切り替えをサポートしていません。",
 		LangSpanish:            "Este agente no soporta el cambio de esfuerzo de razonamiento.",
+	},
+	MsgReasoningCardChangeFailed: {
+		LangEnglish:            "Unable to change reasoning effort. Reopen `/effort` and try again.",
+		LangChinese:            "无法切换推理强度，请重新打开 `/effort` 后再试。",
+		LangTraditionalChinese: "無法切換推理強度，請重新開啟 `/effort` 後再試。",
+		LangJapanese:           "推論強度を変更できませんでした。`/effort` を開き直して再試行してください。",
+		LangSpanish:            "No se pudo cambiar el esfuerzo de razonamiento. Vuelve a abrir `/effort` e inténtalo de nuevo.",
+	},
+	MsgCardActionOwnerUnavailable: {
+		LangEnglish:            "This card's terminal session is unavailable. Reopen the command from the active session.",
+		LangChinese:            "此卡片对应的终端会话当前不可用，请在活动会话中重新打开该命令。",
+		LangTraditionalChinese: "此卡片對應的終端會話目前不可用，請在活動會話中重新開啟該命令。",
+		LangJapanese:           "このカードのターミナルセッションは利用できません。アクティブなセッションからコマンドを開き直してください。",
+		LangSpanish:            "La sesión de terminal de esta tarjeta no está disponible. Vuelve a abrir el comando desde la sesión activa.",
 	},
 	MsgMemoryNotSupported: {
 		LangEnglish:            "This agent does not support memory files.",
@@ -2706,6 +2858,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "ボタンが反応しない場合は直接返信: allow / deny / allow all",
 		LangSpanish:            "Si los botones no responden, responda: allow / deny / allow all",
 	},
+	MsgPermResolvedLocalAllow: {
+		LangEnglish:            "✅ Allowed in terminal",
+		LangChinese:            "✅ 已在终端允许",
+		LangTraditionalChinese: "✅ 已在終端允許",
+		LangJapanese:           "✅ ターミナルで許可済み",
+		LangSpanish:            "✅ Permitido en la terminal",
+	},
+	MsgPermResolvedLocalDeny: {
+		LangEnglish:            "❌ Denied in terminal",
+		LangChinese:            "❌ 已在终端拒绝",
+		LangTraditionalChinese: "❌ 已在終端拒絕",
+		LangJapanese:           "❌ ターミナルで拒否済み",
+		LangSpanish:            "❌ Denegado en la terminal",
+	},
 	MsgAskQuestionTitle: {
 		LangEnglish:            "Agent Question",
 		LangChinese:            "Agent 提问",
@@ -2734,6 +2900,41 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "（複数選択可、カンマで区切る）",
 		LangSpanish:            " (selección múltiple permitida, separe con comas)",
 	},
+	MsgAskQuestionOther: {
+		LangEnglish:            "**Other:** reply with a natural-language answer",
+		LangChinese:            "**其他（Other）：** 直接回复自然语言答案",
+		LangTraditionalChinese: "**其他（Other）：** 直接回覆自然語言答案",
+		LangJapanese:           "**その他（Other）：** 自然言語で直接回答してください",
+		LangSpanish:            "**Otro (Other):** responda directamente en lenguaje natural",
+	},
+	MsgAskQuestionOtherButton: {
+		LangEnglish:            "Other…",
+		LangChinese:            "其他…",
+		LangTraditionalChinese: "其他…",
+		LangJapanese:           "その他…",
+		LangSpanish:            "Otro…",
+	},
+	MsgAskQuestionCustomTitle: {
+		LangEnglish:            "✏️ Custom answer",
+		LangChinese:            "✏️ 自定义回答",
+		LangTraditionalChinese: "✏️ 自訂回答",
+		LangJapanese:           "✏️ 自由回答",
+		LangSpanish:            "✏️ Respuesta personalizada",
+	},
+	MsgAskQuestionCustomPrompt: {
+		LangEnglish:            "Reply in this conversation with your custom answer.",
+		LangChinese:            "请在当前会话中回复你的自定义答案。",
+		LangTraditionalChinese: "請在目前會話中回覆你的自訂答案。",
+		LangJapanese:           "この会話に自由回答を返信してください。",
+		LangSpanish:            "Responda en esta conversación con su respuesta personalizada.",
+	},
+	MsgAskQuestionCustomNote: {
+		LangEnglish:            "Your next text message will be submitted as this answer.",
+		LangChinese:            "你的下一条文本消息将作为本题答案提交。",
+		LangTraditionalChinese: "你的下一則文字訊息將作為本題答案提交。",
+		LangJapanese:           "次のテキストメッセージがこの質問への回答として送信されます。",
+		LangSpanish:            "Su próximo mensaje de texto se enviará como respuesta a esta pregunta.",
+	},
 	MsgAskQuestionPrompt: {
 		LangEnglish:            "❓ **%s**\n\n%s\n\nReply with the option number or type your answer.",
 		LangChinese:            "❓ **%s**\n\n%s\n\n请回复选项编号或直接输入你的回答。",
@@ -2747,6 +2948,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "已回答",
 		LangJapanese:           "回答済み",
 		LangSpanish:            "Respondido",
+	},
+	MsgAskQuestionNoStructuredAnswer: {
+		LangEnglish:            "Handled in terminal (no structured answer returned)",
+		LangChinese:            "已在终端处理（未返回结构化答案）",
+		LangTraditionalChinese: "已在終端處理（未返回結構化答案）",
+		LangJapanese:           "ターミナルで処理済み（構造化された回答は返されませんでした）",
+		LangSpanish:            "Procesado en la terminal (sin respuesta estructurada)",
 	},
 	MsgCommandsTitle: {
 		LangEnglish:            "🔧 **Custom Commands** (%d)\n\n",

@@ -49,6 +49,28 @@ func TestI18n_Tf(t *testing.T) {
 	}
 }
 
+func TestResumeTerminalNoticeFollowsConfiguredLanguage(t *testing.T) {
+	tests := []struct {
+		lang Language
+		want string
+	}{
+		{LangEnglish, "↩ Resumed in TUI · project · Fix resume display · 16 messages loaded"},
+		{LangChinese, "↩ 已在 TUI 恢复 · project · Fix resume display · 已加载 16 条消息"},
+		{LangTraditionalChinese, "↩ 已在 TUI 恢復 · project · Fix resume display · 已載入 16 則訊息"},
+		{LangJapanese, "↩ TUI で再開 · project · Fix resume display · 16 件のメッセージを読み込みました"},
+		{LangSpanish, "↩ Reanudada en TUI · project · Fix resume display · 16 mensajes cargados"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.lang), func(t *testing.T) {
+			got := NewI18n(tt.lang).Tf(
+				MsgResumeTerminalNotice, "project · Fix resume display", 16)
+			if got != tt.want {
+				t.Fatalf("notice = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestI18n_AllKeysHaveEnglish(t *testing.T) {
 	for key, langs := range messages {
 		if _, ok := langs[LangEnglish]; !ok {
@@ -59,7 +81,7 @@ func TestI18n_AllKeysHaveEnglish(t *testing.T) {
 
 func TestDetectLanguage(t *testing.T) {
 	tests := []struct {
-		text    string
+		text     string
 		wantLang Language
 	}{
 		// Japanese Hiragana

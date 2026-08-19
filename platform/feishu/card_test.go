@@ -1,11 +1,16 @@
 package feishu
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 )
 
 func decodeRenderedCard(t *testing.T, card *core.Card) map[string]any {
@@ -310,5 +315,66 @@ func TestBuildCardJSONWithStatusFooter_EmptyFooterFallsThrough(t *testing.T) {
 	// whitespace-only footer also falls through
 	if got := buildCardJSONWithStatusFooter(body, "   \n  "); got != b {
 		t.Errorf("whitespace footer should fall through to buildCardJSON")
+	}
+}
+
+func TestInteractivePlatform_TrackedCardUpdatesExactSentMessage(t *testing.T) {
+	const messageID = "om_permission_card"
+	var patchedPath string
+	var patchedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200,
+				"tenant_access_token": "valid-token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages" && r.Method == http.MethodPost:
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "data": map[string]any{"message_id": messageID},
+			})
+		case strings.Contains(r.URL.Path, "/messages/"+messageID) && r.Method == http.MethodPatch:
+			patchedPath = r.URL.Path
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read patch body: %v", err)
+			}
+			patchedBody = string(body)
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	base := &Platform{
+		platformName: "feishu", domain: srv.URL, appID: "cli_test", appSecret: "secret",
+		useInteractiveCard: true,
+		client: lark.NewClient("cli_test", "secret",
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+		replayClient: lark.NewClient("cli_test", "secret", lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+	}
+	ip := &interactivePlatform{Platform: base}
+	base.self = ip
+
+	handle, err := ip.SendCardWithHandle(context.Background(), replyContext{
+		chatID: "oc_test", sessionKey: "feishu:oc_test:root:om_root",
+	}, core.NewCard().Title("Permission request", "orange").Buttons(
+		core.PrimaryBtn("Allow", "perm:allow"),
+	).Build())
+	if err != nil {
+		t.Fatalf("SendCardWithHandle() error = %v", err)
+	}
+	if err := ip.UpdateCard(context.Background(), handle,
+		core.NewCard().Title("✅ Allowed in terminal", "green").Markdown("Bash: which claude").Build()); err != nil {
+		t.Fatalf("UpdateCard() error = %v", err)
+	}
+	if !strings.Contains(patchedPath, messageID) {
+		t.Fatalf("patch path = %q, want sent message ID %q", patchedPath, messageID)
+	}
+	if !strings.Contains(patchedBody, "Allowed in terminal") || strings.Contains(patchedBody, `"tag":"button"`) {
+		t.Fatalf("unexpected resolved card patch body: %s", patchedBody)
 	}
 }

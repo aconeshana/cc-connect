@@ -58,6 +58,7 @@ type ProgressCardEntry struct {
 type ProgressCardPayload struct {
 	Version   int                 `json:"version,omitempty"`
 	Agent     string              `json:"agent,omitempty"`
+	Title     string              `json:"title,omitempty"`
 	Lang      string              `json:"lang,omitempty"`
 	State     ProgressCardState   `json:"state,omitempty"`
 	Entries   []string            `json:"entries,omitempty"` // legacy fallback
@@ -91,6 +92,12 @@ func BuildProgressCardPayload(entries []string, truncated bool) string {
 
 // BuildProgressCardPayloadV2 encodes ordered typed progress events.
 func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState) string {
+	return BuildProgressCardPayloadV2WithTitle(items, truncated, agent, "", lang, state)
+}
+
+// BuildProgressCardPayloadV2WithTitle adds a stable conversation identity to
+// the dynamic progress state shown in platform conversation lists.
+func BuildProgressCardPayloadV2WithTitle(items []ProgressCardEntry, truncated bool, agent, title string, lang Language, state ProgressCardState) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -119,6 +126,7 @@ func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 	payload := ProgressCardPayload{
 		Version:   2,
 		Agent:     strings.TrimSpace(agent),
+		Title:     strings.TrimSpace(title),
 		Lang:      string(lang),
 		State:     state,
 		Items:     cleaned,
@@ -223,6 +231,7 @@ type compactProgressWriter struct {
 	items      []ProgressCardEntry
 	state      ProgressCardState
 	agentName  string
+	title      func() string
 	lang       Language
 	truncated  bool
 	lastSent   string
@@ -330,13 +339,25 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 	return w
 }
 
+func (w *compactProgressWriter) withTitle(title func() string) *compactProgressWriter {
+	w.title = title
+	return w
+}
+
+func (w *compactProgressWriter) currentTitle() string {
+	if w.title == nil {
+		return ""
+	}
+	return strings.TrimSpace(w.title())
+}
+
 func normalizeProgressAgentLabel(name string) string {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "agent":
 		return "Agent"
 	case "codex":
 		return "Codex"
-	case "claudecode", "claude-code", "cc":
+	case "claudecode", "claude-code", "cc", "sessionhost":
 		return "CC"
 	case "gemini":
 		return "Gemini"
@@ -425,7 +446,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		}
 		w.truncated = truncated
 		if w.usePayload {
-			w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+			w.content = BuildProgressCardPayloadV2WithTitle(w.items, w.truncated, w.agentName, w.currentTitle(), w.lang, w.state)
 			if w.content == "" {
 				slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
 				w.failed = true
@@ -507,7 +528,7 @@ func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 		return true
 	}
 	w.state = state
-	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+	w.content = BuildProgressCardPayloadV2WithTitle(w.items, w.truncated, w.agentName, w.currentTitle(), w.lang, w.state)
 	if w.content == "" || w.content == w.lastSent {
 		return w.content != ""
 	}

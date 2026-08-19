@@ -110,7 +110,7 @@ app_secret = "QhkMpxxxxxxxxxxxxxxxxxxxx"
 # domain = "https://open.feishu.cn" # 可选：覆盖运行时 API/WebSocket 域名
 # enable_feishu_card = true  # 可选：关闭后统一回退纯文本回复
 # thread_isolation = true    # 可选：按飞书 thread/root 隔离群聊会话
-# progress_style = "legacy"  # 可选：legacy | compact | card
+# progress_style = "card"    # 可选：card（默认）| compact | legacy
 # done_emoji = "none"          # 可选：agent 完成回复后添加的表情回复（如 "Done"）；设为 "none" 可禁用
 # image_batch_window_ms = 500  # 可选：连续多图合批窗口（默认 500ms，详见下文）
 ```
@@ -118,10 +118,31 @@ app_secret = "QhkMpxxxxxxxxxxxxxxxxxxxx"
 > 如果应用没有交互卡片权限，或后台未配置卡片回调，可将 `enable_feishu_card = false`，让所有命令统一走纯文本回复，避免卡片发送失败后用户看不到内容。
 > 如果开启 `thread_isolation = true`，群聊里每个根消息 / reply thread 会对应一个独立 agent session；私聊行为保持原样。
 > 在 multi-workspace 模式下，`thread_isolation = true` 也会让每个话题独立绑定 workspace；在话题内执行 `/workspace bind <name>` 不会影响同群的其他话题。已有的群级 binding 会保留为默认值，由尚未显式绑定的话题继承，因此回退到旧版本时仍可使用。
-> `progress_style = "compact"` 会把思考/工具进度合并到一条可更新消息里，减少刷屏；`legacy` 保持原有逐条发送；`card` 会使用结构化卡片（标题 + 进度块）持续更新同一条消息，观感比纯文本更清晰。
+> Session Host 从本机主动绑定会话时，会先创建根卡片，再立即用 `reply_in_thread=true` 打开原生飞书话题。若 `allow_from` 只配置了一个飞书 Open ID，首条话题消息会 @ 该用户，使主动创建的话题进入该用户的订阅/话题入口；无需额外配置。
+> 不配置 `progress_style` 时默认使用 `card`：思考和工具进度会聚合到一张结构化卡片中原地更新，最终回答仍单独发送。`compact` 同样只更新一条消息，但内容是不断追加的纯 Markdown，没有结构化分组和运行/完成状态；`legacy` 保持原有逐条发送，适合排障或兼容旧体验。
 > `domain` 只影响运行时 API / WebSocket 请求地址；CLI `setup/new/bind` 的引导域名仍然使用内置默认值。
 > `done_emoji` 设置后，agent 每次完成回复时会在用户消息上添加指定表情（如 `"Done"` → ✅）。先移除 "OnIt" 表情（如果有），再添加 done 表情。在 quiet 模式下特别有用，因为飞书卡片原地更新不触发推送，done 表情可以通知用户 agent 已完成。设为 `"none"` 或不配置则禁用。
 > `image_batch_window_ms` 控制连续多张图片合并成一条 agent 消息的等待窗口（默认 500ms）。飞书手机端一次连发多张图时，每张图是独立事件；cc-connect 会在窗口内将它们合并成一条多图消息再分发给 agent。如果你的网络/设备发送间隔超过 500ms 且仍被拆成多轮回复（每张图独立处理），可调高到 800–1200ms；如果以单图为主、希望响应更快，可适当调低。设为 `0` 时回退到默认 500ms。
+
+### Session Host 的 `/resume`
+
+Java TUI 内置的 Session Host 使用“一个飞书话题 = 当前一个 Java
+session”的绑定方式。请在话题内发送命令；机器人主聊天中的普通文字、
+slash 命令和附件都会跨 sidecar 去重后静默丢弃，不会自动选择或抢占某个
+在线 TUI。
+
+- `/resume`：显示当前 TUI 项目的历史会话卡片，分页并标记当前会话。
+- `/list`：在 Session Host 模式复用同一张会话卡片。
+- `/resume <序号|名称|ID 前缀>`：直接恢复到当前话题，不创建新话题，
+  也不启动新的 TUI/PTY 进程。
+- Session Host 模式禁用 `/switch` 并提示改用 `/resume`；其他 agent 的
+  `/switch` 行为不变。
+
+卡片按钮携带完整 session ID，点击后先显示 loading，再在原卡片更新成功
+或失败。点击当前会话是幂等操作；当前话题正在执行 turn 时会直接失败且
+不改变绑定。若在本机 TUI 执行 resume，飞书话题会收到紧凑的
+`↩ Resumed in TUI · <session title> · N messages loaded` 提示，并刷新 sidecar 进程内
+最近一张 Resume 卡片；从飞书发起的 resume 不重复发送这条提示。
 
 ---
 

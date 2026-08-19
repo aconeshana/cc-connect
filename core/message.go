@@ -352,7 +352,7 @@ type Message struct {
 	Audio        *AudioAttachment    // voice message (if any)
 	Location     *LocationAttachment // geographical location (if any)
 	ExtraContent string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent
-	OnAccepted   func()              // called once when the engine accepts this message for an agent turn
+	OnAccepted   func()              `json:"-"` // called once when the engine accepts this message for an agent turn
 	ChannelKey   string              // platform-provided channel identifier for workspace binding (optional)
 	// LegacyChannelKey is the platform-provided channel identifier used by an
 	// older workspace-binding scope. When both keys are set, multi-workspace
@@ -371,6 +371,20 @@ type Message struct {
 	// "allow"/"deny" typed by a real user must NOT set this flag — they
 	// continue to flow through the regular message handler.
 	IsPermissionResponse bool
+	// IsInteractionResponse marks any synthesized permission or
+	// AskUserQuestion card/button response. InteractionRequestID binds it to the
+	// exact pending request so a stale card can never answer a later prompt in
+	// the same chat/thread.
+	IsInteractionResponse bool
+	InteractionRequestID  string
+	// InteractionResult lets synchronous card callbacks wait until the owning
+	// agent session has actually accepted or rejected the interaction. It is
+	// process-local and is deliberately omitted from routed JSON messages.
+	InteractionResult   chan InteractionOutcome `json:"-"`
+	interactionAccepted bool
+	// CrossProcessRouted prevents a message delivered through the private Unix
+	// API from being forwarded again by the owning process.
+	CrossProcessRouted bool `json:"-"`
 	// UserMessageTimeMs is the platform message creation time in Unix milliseconds
 	// when known (e.g. Feishu im.message.message_received create_time). Used to
 	// drop late redeliveries that reuse a new message_id but an older create_time
@@ -378,10 +392,28 @@ type Message struct {
 	UserMessageTimeMs int64
 }
 
+type InteractionOutcome struct {
+	Accepted bool   `json:"accepted"`
+	Stale    bool   `json:"stale,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+func (m *Message) completeInteraction(outcome InteractionOutcome) {
+	if m == nil || m.InteractionResult == nil {
+		return
+	}
+	select {
+	case m.InteractionResult <- outcome:
+	default:
+	}
+}
+
 // EventType distinguishes different kinds of agent output.
 type EventType string
 
 const (
+	EventUserInput         EventType = "user_input"         // host-local user submission mirrored to IM
+	EventModel             EventType = "model"              // effective model selected for the current turn
 	EventText              EventType = "text"               // intermediate or final text
 	EventToolUse           EventType = "tool_use"           // tool invocation info
 	EventToolResult        EventType = "tool_result"        // tool execution result
@@ -409,6 +441,10 @@ type UserQuestionOption struct {
 type Event struct {
 	Type                     EventType
 	Content                  string
+	InputOrigin              string         // endpoint that already rendered EventUserInput (tui/remote)
+	Model                    string         // populated for EventModel or a turn-scoped override
+	ReasoningEffort          string         // optional turn-scoped reasoning/effort value
+	PermissionMode           string         // host permission mode active for the current turn/request
 	ToolName                 string         // populated for EventToolUse, EventPermissionRequest
 	ToolInput                string         // human-readable summary of tool input
 	ToolInputRaw             map[string]any // raw tool input (for EventPermissionRequest, used in allow response)
@@ -419,6 +455,16 @@ type Event struct {
 	SessionID                string         // agent-managed session ID for conversation continuity
 	RequestID                string         // unique request ID for EventPermissionRequest
 	Questions                []UserQuestion // populated when ToolName == "AskUserQuestion"
+	DecisionReasonType       string         // host-native permission reason discriminator
+	DecisionReasonDetail     string         // human-readable permission rule/mode/reason
+	SuggestionRuleContent    string         // optional native always-allow rule content
+	SuggestionLabel          string         // optional native always-allow label
+	WorkerID                 string         // optional worker/sub-agent identifier
+	WorkerColor              string         // optional worker badge color
+	DestructiveWarning       string         // optional destructive-operation warning
+	BlockedPath              string         // optional path blocked by a safety constraint
+	CustomMessage            string         // optional tool-provided approval prompt
+	ToolDescription          string         // optional tool metadata description
 	Done                     bool
 	Error                    error
 	InputTokens              int // token usage from agent result events

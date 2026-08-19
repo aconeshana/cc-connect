@@ -31,7 +31,7 @@ const (
 	// pollTimeout, otherwise transient MAX backend lag pushes header arrival
 	// past the deadline and the client cancels the long-poll, triggering a
 	// retry storm.
-	httpTimeout = 90 * time.Second
+	httpTimeout             = 90 * time.Second
 	initialReconnectBackoff = time.Second
 	maxReconnectBackoff     = 30 * time.Second
 	stableConnectionWindow  = 10 * time.Second
@@ -1290,14 +1290,33 @@ func (p *Platform) handleCallback(ctx context.Context, cb *maxCallback) {
 	if handler == nil {
 		return
 	}
+	requestID := ""
+	content := cb.Payload
+	isPermission := false
+	isInteraction := false
+	if strings.HasPrefix(cb.Payload, "perm:") {
+		var decision string
+		var ok bool
+		requestID, decision, ok = core.ParsePermissionAction(cb.Payload)
+		if !ok {
+			return
+		}
+		content = map[string]string{"allow": "allow", "deny": "deny", "allow_all": "allow all"}[decision]
+		isPermission = true
+		isInteraction = true
+	} else if strings.HasPrefix(cb.Payload, "askq:") {
+		var ok bool
+		requestID, _, _, ok = core.ParseAskQuestionAction(cb.Payload)
+		if !ok {
+			return
+		}
+		isInteraction = true
+	}
 	handler(p, &core.Message{
-		SessionKey: sessionKey,
-		Platform:   "max",
-		MessageID:  cb.CallbackID,
-		UserID:     userID,
-		UserName:   cb.User.Name,
-		Content:    cb.Payload,
-		ReplyCtx:   rctx,
+		SessionKey: sessionKey, Platform: "max", MessageID: cb.CallbackID,
+		UserID: userID, UserName: cb.User.Name, Content: content, ReplyCtx: rctx,
+		IsPermissionResponse: isPermission, IsInteractionResponse: isInteraction,
+		InteractionRequestID: requestID,
 	})
 }
 
@@ -1526,13 +1545,13 @@ func splitMessage(text string, maxLen int) []string {
 
 // Compile-time interface compliance assertions.
 var (
-	_ core.Platform                    = (*Platform)(nil)
-	_ core.ImageSender                 = (*Platform)(nil)
-	_ core.FileSender                  = (*Platform)(nil)
-	_ core.AudioSender                 = (*Platform)(nil)
-	_ core.InlineButtonSender          = (*Platform)(nil)
-	_ core.MessageUpdater              = (*Platform)(nil)
-	_ core.TypingIndicator             = (*Platform)(nil)
+	_ core.Platform                      = (*Platform)(nil)
+	_ core.ImageSender                   = (*Platform)(nil)
+	_ core.FileSender                    = (*Platform)(nil)
+	_ core.AudioSender                   = (*Platform)(nil)
+	_ core.InlineButtonSender            = (*Platform)(nil)
+	_ core.MessageUpdater                = (*Platform)(nil)
+	_ core.TypingIndicator               = (*Platform)(nil)
 	_ core.FormattingInstructionProvider = (*Platform)(nil)
-	_ core.ReplyContextReconstructor   = (*Platform)(nil)
+	_ core.ReplyContextReconstructor     = (*Platform)(nil)
 )

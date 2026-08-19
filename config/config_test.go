@@ -656,6 +656,58 @@ func TestLoad_ResolvesEnvPlaceholders(t *testing.T) {
 	}
 }
 
+func TestLoad_ResolvesEnvPlaceholdersFromProtectedEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "credentials.env")
+	if err := os.WriteFile(envPath, []byte("FEISHU_APP_ID=cli_from_file\nFEISHU_APP_SECRET='secret from file'\n"), 0o600); err != nil {
+		t.Fatalf("write env fixture: %v", err)
+	}
+	t.Setenv("FEISHU_APP_ID", "cli_process_wins")
+	configPath := writeConfigFixture(t, `
+env_file = "`+envPath+`"
+
+[[projects]]
+name = "demo"
+
+[projects.agent]
+type = "codex"
+
+[[projects.platforms]]
+type = "feishu"
+
+[projects.platforms.options]
+app_id = "${FEISHU_APP_ID}"
+app_secret = "${FEISHU_APP_SECRET}"
+`)
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	options := cfg.Projects[0].Platforms[0].Options
+	if options["app_id"] != "cli_process_wins" {
+		t.Fatalf("existing environment should win, app_id = %#v", options["app_id"])
+	}
+	if options["app_secret"] != "secret from file" {
+		t.Fatalf("env_file placeholder was not resolved, app_secret = %#v", options["app_secret"])
+	}
+}
+
+func TestLoad_RejectsMalformedEnvFileWithoutLeakingValue(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "credentials.env")
+	if err := os.WriteFile(envPath, []byte("BAD-NAME=super-secret\n"), 0o600); err != nil {
+		t.Fatalf("write env fixture: %v", err)
+	}
+	configPath := writeConfigFixture(t, `env_file = "`+envPath+`"`)
+	_, err := Load(configPath)
+	if err == nil || !strings.Contains(err.Error(), "invalid assignment") {
+		t.Fatalf("Load() error = %v, want invalid assignment", err)
+	}
+	if strings.Contains(err.Error(), "super-secret") {
+		t.Fatalf("error leaked env value: %v", err)
+	}
+}
+
 func TestLoad_MissingEnvPlaceholderBecomesEmptyString(t *testing.T) {
 
 	configPath := writeConfigFixture(t, `
@@ -1667,6 +1719,125 @@ func TestSaveFeishuPlatformCredentials_PreservesCommentsAndUnknownFields(t *test
 	}
 	if !strings.Contains(text, "keep inline comment") {
 		t.Fatalf("expected inline comment to be preserved, got:\n%s", text)
+	}
+}
+
+func TestSaveCredentialEnvUsesOwnerOnlyAtomicFileAndPreservesOtherKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.env")
+	if err := os.WriteFile(path, []byte("OTHER=value\nFEISHU_APP_SECRET=old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveCredentialEnv(path, map[string]string{
+		"FEISHU_APP_ID":     "cli_new",
+		"FEISHU_APP_SECRET": "secret with spaces",
+	}); err != nil {
+		t.Fatalf("SaveCredentialEnv returned error: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("credentials mode = %o, want 600", info.Mode().Perm())
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	for _, expected := range []string{
+		"OTHER=value", "FEISHU_APP_ID=cli_new", `FEISHU_APP_SECRET='secret with spaces'`,
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("credentials missing %q:\n%s", expected, text)
+		}
+	}
+	if strings.Contains(text, "FEISHU_APP_SECRET=old") {
+		t.Fatalf("old secret remained in credentials file:\n%s", text)
+	}
+}
+
+func TestSaveEnvFilePathWritesTopLevelReference(t *testing.T) {
+	configPath := writeConfigFixture(t, `language = "en"
+
+[[projects]]
+name = "demo"
+`)
+	patchConfigPath(t, configPath)
+	envPath := filepath.Join(t.TempDir(), "credentials.env")
+	if err := SaveEnvFilePath(envPath); err != nil {
+		t.Fatalf("SaveEnvFilePath: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg Config
+	if _, err := toml.Decode(string(data), &cfg); err != nil {
+		t.Fatalf("parse updated config: %v\n%s", err, data)
+	}
+	if cfg.EnvFile != envPath {
+		t.Fatalf("env_file = %q, want %q", cfg.EnvFile, envPath)
+	}
+}
+
+func TestSaveSessionHostFeishuTargetCompletesCollaborationConfiguration(t *testing.T) {
+	fixture := `env_file = "/tmp/credentials.env"
+
+[[projects]]
+name = "java-project"
+
+[projects.agent]
+type = "sessionhost"
+
+[projects.agent.options]
+auth_token_env = "CC_SESSION_LINK_TOKEN"
+
+[[projects.platforms]]
+type = "feishu"
+
+[projects.platforms.options]
+app_id = "${FEISHU_APP_ID}"
+app_secret = "${FEISHU_APP_SECRET}"
+`
+	configPath := writeConfigFixture(t, fixture)
+	patchConfigPath(t, configPath)
+
+	if err := SaveSessionHostFeishuTarget(SessionHostFeishuTargetOptions{
+		ProjectName: "java-project",
+		SessionKey:  "feishu:oc_selected:ou_owner",
+		ChatID:      "oc_selected",
+		UserID:      "ou_owner",
+	}); err != nil {
+		t.Fatalf("SaveSessionHostFeishuTarget returned error: %v", err)
+	}
+
+	cfg := readConfigFixture(t, configPath)
+	project := cfg.Projects[0]
+	if project.Agent.Type != "sessionhost" {
+		t.Fatalf("agent type = %q", project.Agent.Type)
+	}
+	if got := stringMapValue(project.Agent.Options, "bind_session_key"); got != "feishu:oc_selected:ou_owner" {
+		t.Fatalf("bind_session_key = %q", got)
+	}
+	targets, ok := project.Agent.Options["collaboration_targets"].(map[string]any)
+	if !ok || stringMapValue(targets, "feishu") != "feishu:oc_selected:ou_owner" {
+		t.Fatalf("collaboration_targets = %#v", project.Agent.Options["collaboration_targets"])
+	}
+	platform := project.Platforms[0]
+	for key, expected := range map[string]string{
+		"allow_from": "ou_owner", "allow_chat": "oc_selected", "progress_style": "card",
+	} {
+		if got := stringMapValue(platform.Options, key); got != expected {
+			t.Fatalf("%s = %q, want %q", key, got, expected)
+		}
+	}
+	for key := range map[string]bool{
+		"thread_isolation": true, "enable_feishu_card": true,
+	} {
+		if got, _ := platform.Options[key].(bool); !got {
+			t.Fatalf("%s = %#v, want true", key, platform.Options[key])
+		}
 	}
 }
 

@@ -295,6 +295,16 @@ func TestReconstructReplyCtx_ThreadSessionKey(t *testing.T) {
 	}
 }
 
+func TestPlatformImplementsSessionThreadBinder(t *testing.T) {
+	var platform any = &Platform{}
+	if _, ok := platform.(core.SessionThreadBinder); !ok {
+		t.Fatal("discord should expose native thread binding to Session Host")
+	}
+	if _, ok := platform.(core.FreshSessionThreadBinder); !ok {
+		t.Fatal("discord should expose fresh native thread creation to Session Host")
+	}
+}
+
 func TestResolveCronReplyTarget_CreatesStandaloneThread(t *testing.T) {
 	ops := fakeThreadOps{
 		resolveChannel: func(channelID string) (*discordgo.Channel, error) {
@@ -1696,4 +1706,3 @@ func basePlatformFor(t *testing.T, pAny core.Platform) *Platform {
 		return nil
 	}
 }
-

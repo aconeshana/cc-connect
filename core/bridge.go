@@ -958,24 +958,32 @@ func (a *bridgeAdapter) handleCardAction(raw json.RawMessage) {
 
 	// perm: — permission response; convert to a regular message for the engine
 	if strings.HasPrefix(ca.Action, "perm:") {
+		requestID, decision, ok := ParsePermissionAction(ca.Action)
+		if !ok {
+			return
+		}
 		var responseText string
-		switch ca.Action {
-		case "perm:allow":
+		switch decision {
+		case "allow":
 			responseText = "allow"
-		case "perm:deny":
+		case "deny":
 			responseText = "deny"
-		case "perm:allow_all":
+		case "allow_all":
 			responseText = "allow all"
 		default:
 			return
 		}
-		a.dispatchAsPermissionResponse(ref, ca.SessionKey, ca.ReplyCtx, responseText)
+		a.dispatchAsPermissionResponse(ref, ca.SessionKey, ca.ReplyCtx, responseText, requestID)
 		return
 	}
 
 	// askq: — AskUserQuestion answer; forward as a regular message
 	if strings.HasPrefix(ca.Action, "askq:") {
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.ReplyCtx, ca.Action)
+		requestID, _, _, ok := ParseAskQuestionAction(ca.Action)
+		if !ok {
+			return
+		}
+		a.dispatchAsInteractionResponse(ref, ca.SessionKey, ca.ReplyCtx, ca.Action, requestID)
 		return
 	}
 
@@ -1032,18 +1040,34 @@ func (a *bridgeAdapter) dispatchAsMessage(ref *bridgeEngineRef, sessionKey, repl
 // (e.g. user tapped an old "Allow" card after the session was reset) —
 // preventing the literal "allow"/"deny" string from reaching the agent's
 // prompt stream (issue #826).
-func (a *bridgeAdapter) dispatchAsPermissionResponse(ref *bridgeEngineRef, sessionKey, replyCtx, content string) {
+func (a *bridgeAdapter) dispatchAsPermissionResponse(ref *bridgeEngineRef, sessionKey, replyCtx,
+	content, requestID string) {
 	if ref.platform.handler == nil {
 		return
 	}
 	msg := &Message{
-		SessionKey:           sessionKey,
-		Platform:             a.platform,
-		UserID:               "web-admin",
-		UserName:             "Web Admin",
-		Content:              content,
-		ReplyCtx:             newBridgeReplyCtx(a, sessionKey, replyCtx),
-		IsPermissionResponse: true,
+		SessionKey:            sessionKey,
+		Platform:              a.platform,
+		UserID:                "web-admin",
+		UserName:              "Web Admin",
+		Content:               content,
+		ReplyCtx:              newBridgeReplyCtx(a, sessionKey, replyCtx),
+		IsPermissionResponse:  true,
+		IsInteractionResponse: true,
+		InteractionRequestID:  requestID,
+	}
+	go ref.platform.handler(ref.platform, msg)
+}
+
+func (a *bridgeAdapter) dispatchAsInteractionResponse(ref *bridgeEngineRef, sessionKey, replyCtx,
+	content, requestID string) {
+	if ref.platform.handler == nil {
+		return
+	}
+	msg := &Message{
+		SessionKey: sessionKey, Platform: a.platform, UserID: "web-admin", UserName: "Web Admin",
+		Content: content, ReplyCtx: newBridgeReplyCtx(a, sessionKey, replyCtx),
+		IsInteractionResponse: true, InteractionRequestID: requestID,
 	}
 	go ref.platform.handler(ref.platform, msg)
 }

@@ -179,6 +179,30 @@ func TestBuildAndParseProgressCardPayloadV2(t *testing.T) {
 	}
 }
 
+func TestProgressCardPayloadCarriesDynamicSessionTitle(t *testing.T) {
+	p := &previewCapturePlatform{}
+	replyCtx := progressHintReplyCtx{style: progressStyleCard, payload: true}
+	title := "claude-code-java · Initial topic"
+	w := newCompactProgressWriter(
+		context.Background(), p, replyCtx, "cc", LangEnglish, nil,
+	).withTitle(func() string { return title })
+	if !w.AppendEvent(ProgressEntryThinking, "planning", "", "planning") {
+		t.Fatal("AppendEvent() = false")
+	}
+	parsed, ok := ParseProgressCardPayload(p.started[0])
+	if !ok || parsed.Title != title {
+		t.Fatalf("initial title = %#v", parsed)
+	}
+	title = "claude-code-java · AI generated topic"
+	if !w.Finalize(ProgressCardStateCompleted) {
+		t.Fatal("Finalize() = false")
+	}
+	parsed, ok = ParseProgressCardPayload(p.updated[0])
+	if !ok || parsed.Title != title {
+		t.Fatalf("final title = %#v", parsed)
+	}
+}
+
 func TestParseProgressCardPayloadRejectsInvalid(t *testing.T) {
 	if _, ok := ParseProgressCardPayload("plain text"); ok {
 		t.Fatal("expected parse failure for plain text")

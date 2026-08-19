@@ -865,15 +865,16 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 
 	// AskUserQuestion callbacks (askq:qIdx:optIdx)
 	if strings.HasPrefix(data, "askq:") {
-		parts := strings.SplitN(data, ":", 3)
+		requestID, _, _, ok := core.ParseAskQuestionAction(data)
+		if !ok {
+			return
+		}
 		choiceLabel := data
-		if len(parts) == 3 {
-			if msg.ReplyMarkup != nil {
-				for _, row := range msg.ReplyMarkup.InlineKeyboard {
-					for _, btn := range row {
-						if btn.CallbackData == data {
-							choiceLabel = "✅ " + btn.Text
-						}
+		if msg.ReplyMarkup != nil {
+			for _, row := range msg.ReplyMarkup.InlineKeyboard {
+				for _, btn := range row {
+					if btn.CallbackData == data {
+						choiceLabel = "✅ " + btn.Text
 					}
 				}
 			}
@@ -893,40 +894,44 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 		}
 
 		p.handler(p, &core.Message{
-			SessionKey: sessionKey,
-			Platform:   "telegram",
-			UserID:     userID,
-			UserName:   userName,
-			ChatName:   chatName,
-			Content:    data,
-			MessageID:  strconv.Itoa(msgID),
-			ChannelKey: channelKey,
-			ReplyCtx:   rctx,
+			SessionKey:            sessionKey,
+			Platform:              "telegram",
+			UserID:                userID,
+			UserName:              userName,
+			ChatName:              chatName,
+			Content:               data,
+			MessageID:             strconv.Itoa(msgID),
+			ChannelKey:            channelKey,
+			ReplyCtx:              rctx,
+			IsInteractionResponse: true,
+			InteractionRequestID:  requestID,
 		})
 		return
 	}
 
 	// Permission callbacks (perm:allow, perm:deny, perm:allow_all)
-	var responseText string
-	switch data {
-	case "perm:allow":
-		responseText = "allow"
-	case "perm:deny":
-		responseText = "deny"
-	case "perm:allow_all":
-		responseText = "allow all"
-	default:
+	requestID, decision, ok := core.ParsePermissionAction(data)
+	if !ok {
 		slog.Debug("telegram: unknown callback data", "data", data)
 		return
 	}
+	var responseText string
+	switch decision {
+	case "allow":
+		responseText = "allow"
+	case "deny":
+		responseText = "deny"
+	case "allow_all":
+		responseText = "allow all"
+	}
 
 	choiceLabel := responseText
-	switch data {
-	case "perm:allow":
+	switch decision {
+	case "allow":
 		choiceLabel = "✅ Allowed"
-	case "perm:deny":
+	case "deny":
 		choiceLabel = "❌ Denied"
-	case "perm:allow_all":
+	case "allow_all":
 		choiceLabel = "✅ Allow All"
 	}
 
@@ -944,16 +949,18 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 	}
 
 	p.handler(p, &core.Message{
-		SessionKey:           sessionKey,
-		Platform:             "telegram",
-		UserID:               userID,
-		UserName:             userName,
-		ChatName:             chatName,
-		Content:              responseText,
-		MessageID:            strconv.Itoa(msgID),
-		ChannelKey:           channelKey,
-		ReplyCtx:             rctx,
-		IsPermissionResponse: true,
+		SessionKey:            sessionKey,
+		Platform:              "telegram",
+		UserID:                userID,
+		UserName:              userName,
+		ChatName:              chatName,
+		Content:               responseText,
+		MessageID:             strconv.Itoa(msgID),
+		ChannelKey:            channelKey,
+		ReplyCtx:              rctx,
+		IsPermissionResponse:  true,
+		IsInteractionResponse: true,
+		InteractionRequestID:  requestID,
 	})
 }
 

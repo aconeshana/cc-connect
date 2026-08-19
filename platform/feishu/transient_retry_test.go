@@ -293,6 +293,203 @@ func TestCreateMessageRetriesOnTransientNetworkError(t *testing.T) {
 	}
 }
 
+func TestBindSessionThreadCreatesRootAndReturnsThreadScopedContext(t *testing.T) {
+	const appID = "cli_bind_session_thread"
+	const appSecret = "secret"
+
+	var receivedChatID string
+	var replyCalls atomic.Int32
+	var replyInThread bool
+	var replyContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200,
+				"tenant_access_token": "valid-token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			receivedChatID, _ = body["receive_id"].(string)
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{"message_id": "om_host_root"},
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages/om_host_root/reply":
+			replyCalls.Add(1)
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode reply body: %v", err)
+			}
+			replyInThread, _ = body["reply_in_thread"].(bool)
+			encoded, _ := body["content"].(string)
+			var content map[string]string
+			if err := json.Unmarshal([]byte(encoded), &content); err != nil {
+				t.Fatalf("decode reply content: %v", err)
+			}
+			replyContent = content["text"]
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{
+					"message_id": "om_host_welcome",
+					"root_id":    "om_host_root",
+					"thread_id":  "omt_host_thread",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName: "feishu", domain: srv.URL, appID: appID, appSecret: appSecret,
+		threadIsolation: true, allowFrom: "ou_owner",
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+		replayClient: lark.NewClient(appID, appSecret,
+			lark.WithEnableTokenCache(false), lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client())),
+	}
+	p.userNameCache.Store("ou_owner", "Owner")
+
+	key, rawCtx, err := p.BindSessionThread(context.Background(),
+		"feishu:oc_host_chat:ou_owner", "host-session-123", "Fix login flow")
+	if err != nil {
+		t.Fatalf("BindSessionThread() error = %v", err)
+	}
+	if receivedChatID != "oc_host_chat" {
+		t.Fatalf("receive_id = %q, want oc_host_chat", receivedChatID)
+	}
+	if replyCalls.Load() != 1 {
+		t.Fatalf("reply calls = %d, want 1", replyCalls.Load())
+	}
+	if !replyInThread {
+		t.Fatal("host bootstrap reply did not set reply_in_thread=true")
+	}
+	if !strings.Contains(replyContent, `<at user_id="ou_owner">`) {
+		t.Fatalf("host bootstrap reply did not mention owner: %q", replyContent)
+	}
+	if key != "feishu:oc_host_chat:root:om_host_root" {
+		t.Fatalf("session key = %q", key)
+	}
+	rc := rawCtx.(replyContext)
+	if rc.messageID != "om_host_root" || rc.threadID != "omt_host_thread" ||
+		rc.sessionKey != key || rc.chatID != "oc_host_chat" {
+		t.Fatalf("reply context = %#v", rc)
+	}
+	if !p.isActiveThreadSession(key) {
+		t.Fatal("created host thread was not marked active")
+	}
+	if !p.isHostThreadSession(key) {
+		t.Fatal("created host thread does not allow mention-free text replies")
+	}
+}
+
+func TestHostThreadOwnerIDRequiresOneExplicitOpenID(t *testing.T) {
+	tests := []struct {
+		name      string
+		baseKey   string
+		allowFrom string
+		want      string
+		ok        bool
+	}{
+		{name: "binding target owner", baseKey: "feishu:oc_chat:ou_bound", allowFrom: "ou_other,ou_admin", want: "ou_bound", ok: true},
+		{name: "one allowed owner fallback", baseKey: "feishu:oc_chat:root:om_root", allowFrom: "ou_owner", want: "ou_owner", ok: true},
+		{name: "multiple owners", allowFrom: "ou_a,ou_b"},
+		{name: "wildcard", allowFrom: "*"},
+		{name: "empty", allowFrom: ""},
+		{name: "non open id", allowFrom: "user@example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := (&Platform{
+				platformName: "feishu", allowFrom: tt.allowFrom,
+			}).hostThreadOwnerID(tt.baseKey)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("hostThreadOwnerID() = (%q, %v), want (%q, %v)",
+					got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestBindSessionThreadRestoresExistingThreadWithoutCreatingMessage(t *testing.T) {
+	p := &Platform{platformName: "feishu", threadIsolation: true}
+	const key = "feishu:oc_host_chat:root:om_existing_root"
+
+	boundKey, rawCtx, err := p.BindSessionThread(
+		context.Background(), key, "host-session-123", "Existing session")
+	if err != nil {
+		t.Fatalf("BindSessionThread() error = %v", err)
+	}
+	if boundKey != key {
+		t.Fatalf("bound key = %q, want %q", boundKey, key)
+	}
+	rc := rawCtx.(replyContext)
+	if rc.messageID != "om_existing_root" || rc.chatID != "oc_host_chat" || rc.sessionKey != key {
+		t.Fatalf("reply context = %#v", rc)
+	}
+	if !p.isHostThreadSession(key) || !p.isActiveThreadSession(key) {
+		t.Fatal("restored thread was not marked as a host thread")
+	}
+}
+
+func TestCreateSessionThreadFromExistingThreadCreatesSiblingRoot(t *testing.T) {
+	const appID = "cli_fresh_session_thread"
+	var createCalls atomic.Int32
+	var replyCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200,
+				"tenant_access_token": "valid-token",
+			})
+		case "/open-apis/im/v1/messages":
+			createCalls.Add(1)
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{"message_id": "om_sibling_root"},
+			})
+		case "/open-apis/im/v1/messages/om_sibling_root/reply":
+			replyCalls.Add(1)
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{
+					"message_id": "om_sibling_welcome",
+					"root_id":    "om_sibling_root",
+					"thread_id":  "omt_sibling_thread",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	p := &Platform{
+		platformName: "feishu", domain: srv.URL, appID: appID, appSecret: "secret",
+		threadIsolation: true,
+		client: lark.NewClient(appID, "secret", lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client())),
+	}
+
+	key, _, err := p.CreateSessionThread(context.Background(),
+		"feishu:oc_host_chat:root:om_old_root", "Sibling session")
+	if err != nil {
+		t.Fatalf("CreateSessionThread() error = %v", err)
+	}
+	if key != "feishu:oc_host_chat:root:om_sibling_root" ||
+		createCalls.Load() != 1 || replyCalls.Load() != 1 {
+		t.Fatalf("key=%q createCalls=%d replyCalls=%d", key, createCalls.Load(), replyCalls.Load())
+	}
+}
+
 func TestReplyDoesNotRetryOnNonTransientAPIError(t *testing.T) {
 	const appID = "cli_no_transient_retry"
 	const appSecret = "secret"

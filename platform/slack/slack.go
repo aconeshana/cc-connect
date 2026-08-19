@@ -29,6 +29,9 @@ type replyContext struct {
 	timestamp string // thread_ts for threading replies
 }
 
+var _ core.SessionThreadBinder = (*Platform)(nil)
+var _ core.FreshSessionThreadBinder = (*Platform)(nil)
+
 type Platform struct {
 	botToken         string
 	appToken         string
@@ -604,6 +607,63 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		rc.timestamp = strings.TrimPrefix(parts[2], "t:")
 	}
 	return rc, nil
+}
+
+// BindSessionThread implements core.SessionThreadBinder. Slack threads do not
+// need a separate create API: the first bot post with thread_ts equal to a
+// top-level message timestamp materializes the conversation thread. Existing
+// thread-scoped keys are restored without posting another root.
+func (p *Platform) BindSessionThread(
+	ctx context.Context, baseSessionKey, sessionID, title string,
+) (string, any, error) {
+	_ = sessionID
+	raw := strings.TrimSpace(baseSessionKey)
+	parts := strings.SplitN(raw, ":", 4)
+	if len(parts) < 2 || parts[0] != "slack" || parts[1] == "" {
+		return "", nil, fmt.Errorf("slack: invalid host session key %q", baseSessionKey)
+	}
+	channel := parts[1]
+	if len(parts) == 4 && parts[2] == "t" && parts[3] != "" {
+		return raw, replyContext{channel: channel, timestamp: parts[3]}, nil
+	}
+	// An inbound top-level Slack event carries its timestamp as message ID; use
+	// it as the native thread root when available. Proactive local sessions have
+	// no user message to anchor, so post one short root and use the returned ts.
+	threadTS := ""
+	if len(parts) == 3 && strings.Contains(parts[2], ".") {
+		threadTS = parts[2]
+	}
+	if threadTS == "" {
+		return p.createSessionThreadInChannel(ctx, channel, title)
+	}
+	key := fmt.Sprintf("slack:%s:t:%s", channel, threadTS)
+	return key, replyContext{channel: channel, timestamp: threadTS}, nil
+}
+
+func (p *Platform) CreateSessionThread(
+	ctx context.Context, baseSessionKey, title string,
+) (string, any, error) {
+	parts := strings.SplitN(strings.TrimSpace(baseSessionKey), ":", 4)
+	if len(parts) < 2 || parts[0] != "slack" || parts[1] == "" {
+		return "", nil, fmt.Errorf("slack: invalid host session key %q", baseSessionKey)
+	}
+	return p.createSessionThreadInChannel(ctx, parts[1], title)
+}
+
+func (p *Platform) createSessionThreadInChannel(
+	ctx context.Context, channel, title string,
+) (string, any, error) {
+	rootText := strings.TrimSpace(title)
+	if rootText == "" {
+		rootText = "Claude Code"
+	}
+	_, threadTS, err := p.client.PostMessageContext(ctx, channel,
+		slack.MsgOptionText(rootText, false))
+	if err != nil {
+		return "", nil, fmt.Errorf("slack: create host thread root: %w", err)
+	}
+	key := fmt.Sprintf("slack:%s:t:%s", channel, threadTS)
+	return key, replyContext{channel: channel, timestamp: threadTS}, nil
 }
 
 func (p *Platform) resolveUserName(userID string) string {

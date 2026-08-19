@@ -44,6 +44,12 @@ type CardNote struct {
 	Tag  string
 }
 
+// ResumeCardOwnerUpdatedTag marks a routed Resume result whose owning engine
+// already patched the exact source card. Feishu uses it to avoid applying the
+// same callback result later from a non-owner sidecar, which could overwrite a
+// newer local activation card.
+const ResumeCardOwnerUpdatedTag = "session-host-resume-owner-updated"
+
 // CardListItem renders a row with description text on the left and a button on the right.
 // On Feishu this maps to div+extra; on other platforms it degrades to a text line.
 type CardListItem struct {
@@ -281,6 +287,19 @@ func (c *Card) HasButtons() bool {
 	for _, elem := range c.Elements {
 		switch elem.(type) {
 		case CardActions, CardListItem, CardSelect:
+			return true
+		}
+	}
+	return false
+}
+
+// HasNoteTag reports machine-readable card metadata without rendering it.
+func (c *Card) HasNoteTag(tag string) bool {
+	if c == nil || tag == "" {
+		return false
+	}
+	for _, elem := range c.Elements {
+		if note, ok := elem.(CardNote); ok && note.Tag == tag {
 			return true
 		}
 	}

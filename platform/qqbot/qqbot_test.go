@@ -1124,6 +1124,27 @@ func TestHandleInteractionCreate_Allow(t *testing.T) {
 	}
 }
 
+func TestHandleInteractionCreate_AskQuestionRequestID(t *testing.T) {
+	p := &Platform{allowFrom: "*"}
+	var got *core.Message
+	p.handler = func(_ core.Platform, msg *core.Message) { got = msg }
+
+	payload := map[string]any{
+		"id": "interact-ask", "group_openid": "group-1",
+		"group_member_openid": "user-1", "chat_type": 1,
+		"data": map[string]any{"type": 11, "resolved": map[string]any{
+			"button_data": "askq:req-qq-1:0:2:qqbot:group-1:user-1",
+		}},
+	}
+	data, _ := json.Marshal(payload)
+	p.handleInteractionCreate(data)
+
+	if got == nil || !got.IsInteractionResponse || got.IsPermissionResponse ||
+		got.InteractionRequestID != "req-qq-1" || got.Content != "askq:req-qq-1:0:2" {
+		t.Fatalf("AskUserQuestion callback = %#v", got)
+	}
+}
+
 func TestHandleInteractionCreate_Deny(t *testing.T) {
 	p := &Platform{
 		allowFrom: "*",
