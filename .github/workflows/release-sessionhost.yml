@@ -1,0 +1,118 @@
+name: Release Session Host sidecar
+
+on:
+  push:
+    tags:
+      - "v*-sessionhost.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing session-host release tag
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./agent/sessionhost ./core ./platform/feishu ./tests/release_local -count=1
+      - run: go test -race ./agent/sessionhost ./core ./platform/feishu -count=1
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build web assets
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Build and package sidecar
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.goos }}/${{ matrix.goarch }}
+          ASSET_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          build_time="$(git show -s --format=%cI HEAD)"
+          make release TARGET="$TARGET" AGENTS=sessionhost \
+            VERSION="$RELEASE_TAG" COMMIT="$commit" BUILD_TIME="$build_time"
+          mkdir -p "release/stage-$ASSET_TARGET"
+          cp "dist/cc-connect-$RELEASE_TAG-${TARGET%/*}-${TARGET#*/}" \
+            "release/stage-$ASSET_TARGET/cc-connect"
+          tar -C "release/stage-$ASSET_TARGET" -czf \
+            "release/cc-connect-$RELEASE_TAG-$ASSET_TARGET.tar.gz" cc-connect
+          rm -rf "release/stage-$ASSET_TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sessionhost-${{ matrix.target }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: sessionhost-*
+          path: release
+          merge-multiple: true
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git rev-parse "$RELEASE_TAG^{commit}" >/dev/null
+          cd release
+          sha256sum cc-connect-*.tar.gz > checksums.txt
+          gh release create "$RELEASE_TAG" cc-connect-*.tar.gz checksums.txt \
+            --verify-tag \
+            --title "cc-connect $RELEASE_TAG (Session Host sidecar)" \
+            --notes "Pinned Session Host distribution for claude-code-java. Source commit: $(git -C .. rev-parse HEAD)."

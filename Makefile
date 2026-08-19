@@ -3,9 +3,10 @@ MODULE     := github.com/chenhg5/cc-connect
 CMD        := ./cmd/cc-connect
 DIST       := dist
 
-VERSION := v1.3.3
-COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
-BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT     ?= $(shell git rev-parse HEAD 2>/dev/null || echo "none")
+BUILD_TIME ?= $(shell git show -s --format=%cI HEAD 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+GO_BUILD_FLAGS ?= -trimpath -buildvcs=false
 
 LDFLAGS := -s -w \
   -X main.version=$(VERSION) \
@@ -67,17 +68,20 @@ _TAGS_FLAG  := $(if $(_BUILD_TAGS),-tags '$(_BUILD_TAGS)',)
 _NOWEB_TAGS := $(strip $(_BUILD_TAGS) no_web)
 _NOWEB_TAGS_FLAG := $(if $(_NOWEB_TAGS),-tags '$(_NOWEB_TAGS)',)
 
-.PHONY: build run clean test test-fast test-full test-smoke test-e2e test-release test-release-local test-performance pre-test lint release release-all web
+.PHONY: build run clean test test-fast test-full test-smoke test-e2e test-release test-release-local test-performance pre-test lint release release-all print-build-metadata web
+
+print-build-metadata:
+	@printf 'version=%s\ncommit=%s\nbuild_time=%s\n' '$(VERSION)' '$(COMMIT)' '$(BUILD_TIME)'
 
 web:
 	@if [ ! -d web/node_modules ]; then cd web && npm install; fi
 	cd web && npm run build
 
 build: web
-	go build $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(APP) $(CMD)
+	go build $(GO_BUILD_FLAGS) $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(APP) $(CMD)
 
 build-noweb:
-	go build $(_NOWEB_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(APP) $(CMD)
+	go build $(GO_BUILD_FLAGS) $(_NOWEB_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(APP) $(CMD)
 
 run: build
 	./$(APP)
@@ -155,7 +159,7 @@ release-all: web clean
 		$(eval OUT    := $(DIST)/$(APP)-$(VERSION)-$(GOOS)-$(GOARCH)$(EXT)) \
 		echo "Building $(OUT)" && \
 		GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 \
-			go build $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(OUT) $(CMD) && \
+			go build $(GO_BUILD_FLAGS) $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(OUT) $(CMD) && \
 	) true
 	@echo "Packaging archives..."
 	@cd $(DIST) && for f in $(APP)-*; do \
@@ -180,5 +184,5 @@ release:
 	$(eval EXT    := $(if $(filter windows,$(GOOS)),.exe,))
 	$(eval OUT    := $(DIST)/$(APP)-$(VERSION)-$(GOOS)-$(GOARCH)$(EXT))
 	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 \
-		go build $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(OUT) $(CMD)
+		go build $(GO_BUILD_FLAGS) $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(OUT) $(CMD)
 	@echo "Built: $(OUT)"
