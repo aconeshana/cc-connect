@@ -34,7 +34,7 @@ PLATFORMS := \
 # ---------------------------------------------------------------------------
 
 ALL_AGENTS    := acp antigravity claudecode codex copilot cursor devin gemini iflow kimi opencode pi qoder reasonix sessionhost tmux
-ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex cloud_web tuitui
+ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line weibo max matrix webex cloud_web tuitui googlechat
 ALL_EXTRAS    := web
 
 COMMA := ,

@@ -896,6 +896,11 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 	switch {
 	case strings.HasPrefix(data.CustomID, "cmd:"):
 		content = strings.TrimPrefix(data.CustomID, "cmd:")
+		if content == "" {
+			slog.Debug("discord: empty command component interaction")
+			return
+		}
+		choiceLabel = content
 	case strings.HasPrefix(data.CustomID, "perm:"):
 		var decision string
 		var ok bool
@@ -953,6 +958,21 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 		ChatName: chatName, ReplyCtx: rc, IsPermissionResponse: isPermission,
 		IsInteractionResponse: isInteraction, InteractionRequestID: requestID,
 	})
+}
+
+func discordComponentCommand(customID string) (command string, isPermissionResponse bool, ok bool) {
+	if command, found := strings.CutPrefix(customID, "cmd:"); found && command != "" {
+		return command, false, true
+	}
+	if action, found := strings.CutPrefix(customID, "perm:"); found {
+		switch action {
+		case "allow", "deny":
+			return action, true, true
+		case "allow_all":
+			return "allow all", true, true
+		}
+	}
+	return "", false, false
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
@@ -1181,10 +1201,6 @@ func buildDiscordActionRows(rows [][]core.ButtonOption) []discordgo.MessageCompo
 }
 
 func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string, buttons [][]core.ButtonOption) error {
-	rc, ok := rctx.(*interactionReplyCtx)
-	if !ok {
-		return core.ErrNotSupported
-	}
 	if len(buttons) == 0 {
 		return fmt.Errorf("discord: no buttons provided")
 	}
@@ -1192,17 +1208,32 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 	if len(components) == 0 {
 		return fmt.Errorf("discord: no buttons provided")
 	}
-	if err := p.sendInteraction(rc, content); err != nil {
-		return err
+
+	switch rc := rctx.(type) {
+	case *interactionReplyCtx:
+		if err := p.sendInteraction(rc, content); err != nil {
+			return err
+		}
+		_, err := p.session.FollowupMessageCreate(rc.interaction, true, &discordgo.WebhookParams{
+			Content:    content,
+			Components: components,
+		})
+		if err != nil {
+			return fmt.Errorf("discord: send button followup: %w", err)
+		}
+		return nil
+	case replyContext:
+		_, err := p.session.ChannelMessageSendComplex(rc.targetChannelID(), &discordgo.MessageSend{
+			Content:    content,
+			Components: components,
+		})
+		if err != nil {
+			return fmt.Errorf("discord: send channel buttons: %w", err)
+		}
+		return nil
+	default:
+		return core.ErrNotSupported
 	}
-	_, err := p.session.FollowupMessageCreate(rc.interaction, true, &discordgo.WebhookParams{
-		Content:    content,
-		Components: components,
-	})
-	if err != nil {
-		return fmt.Errorf("discord: send button followup: %w", err)
-	}
-	return nil
 }
 
 func (p *progressPlatform) ProgressUpdateInterval() time.Duration {
