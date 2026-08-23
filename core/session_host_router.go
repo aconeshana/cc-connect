@@ -207,11 +207,11 @@ func (r *SessionHostRouter) RegisterInteraction(
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	if err := lockFile(lock); err != nil {
 		return nil, err
 	}
-	defer unlockFile(lock)
+	defer func() { _ = unlockFile(lock) }()
 
 	now := r.now()
 	current, err := r.lookupInteractionFile(requestID, hostSessionID)
