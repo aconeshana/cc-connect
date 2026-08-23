@@ -3340,7 +3340,7 @@ func TestSendPermissionPrompt_BindsActionsToRequestID(t *testing.T) {
 	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 
 	e.sendPermissionPrompt(p, "ctx", "full prompt", "Bash", "pwd",
-		PermissionPromptContext{RequestID: "req-card-1"})
+		PermissionPromptContext{RequestID: "req-card-1", HostSessionID: "java-session-card-1"})
 
 	buttons := p.sentCards[0].CollectButtons()
 	if got := buttons[0][0].Data; got != "perm:req-card-1:allow" {
@@ -3351,6 +3351,17 @@ func TestSendPermissionPrompt_BindsActionsToRequestID(t *testing.T) {
 	}
 	if got := buttons[1][0].Data; got != "perm:req-card-1:allow_all" {
 		t.Fatalf("allow-all action = %q", got)
+	}
+	for _, element := range p.sentCards[0].Elements {
+		actions, ok := element.(CardActions)
+		if !ok {
+			continue
+		}
+		for _, button := range actions.Buttons {
+			if got := button.Extra["host_session_id"]; got != "java-session-card-1" {
+				t.Fatalf("host_session_id = %q, want java-session-card-1", got)
+			}
+		}
 	}
 }
 
@@ -7178,7 +7189,7 @@ func TestSendAskQuestionPrompt_CardPlatform_MultiSelectShowsOtherOption(t *testi
 	questions := testQuestions()
 	questions[0].MultiSelect = true
 
-	e.sendAskQuestionPrompt(p, "ctx", questions, 0, "req-multi-other")
+	e.sendAskQuestionPrompt(p, "ctx", questions, 0, "req-multi-other", "java-ask-session")
 
 	if len(p.sentCards) != 1 {
 		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
@@ -7190,6 +7201,12 @@ func TestSendAskQuestionPrompt_CardPlatform_MultiSelectShowsOtherOption(t *testi
 	rows := p.sentCards[0].CollectButtons()
 	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0].Data != "askq:req-multi-other:0:other" {
 		t.Fatalf("multi-select Other action = %#v, want request-bound explicit Other button", rows)
+	}
+	for _, element := range p.sentCards[0].Elements {
+		if actions, ok := element.(CardActions); ok &&
+			actions.Buttons[0].Extra["host_session_id"] != "java-ask-session" {
+			t.Fatalf("AskUserQuestion host session extra = %#v", actions.Buttons[0].Extra)
+		}
 	}
 }
 

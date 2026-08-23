@@ -823,6 +823,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			return nil, nil
 		}
 
+		hostSessionID, _ := event.Event.Action.Value["host_session_id"].(string)
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 		result := make(chan core.InteractionOutcome, 1)
 		go p.dispatchCoreMessage(&core.Message{
@@ -836,6 +837,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			IsPermissionResponse:  true,
 			IsInteractionResponse: true,
 			InteractionRequestID:  requestID,
+			InteractionSessionID:  hostSessionID,
 			InteractionResult:     result,
 		})
 
@@ -882,6 +884,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			return nil, nil
 		}
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+		hostSessionID, _ := event.Event.Action.Value["host_session_id"].(string)
 		msg := &core.Message{
 			SessionKey:            sessionKey,
 			Platform:              p.platformName,
@@ -892,6 +895,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			ReplyCtx:              rctx,
 			IsInteractionResponse: true,
 			InteractionRequestID:  requestID,
+			InteractionSessionID:  hostSessionID,
 		}
 		if optionIndex == 0 {
 			result := make(chan core.InteractionOutcome, 1)

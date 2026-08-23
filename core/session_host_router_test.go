@@ -359,6 +359,105 @@ func TestSessionHostRouterForwardsInteractionToOwningAPIServer(t *testing.T) {
 	}
 }
 
+func TestSessionHostRouterKeepsConcurrentHostInteractionsOnTheirOwningProcesses(t *testing.T) {
+	dataDir := t.TempDir()
+	socketDir, err := os.MkdirTemp("/tmp", "cc-interaction-route-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+
+	const (
+		keyA     = "feishu:oc_chat:root:thread-a"
+		keyB     = "feishu:oc_chat:root:thread-b"
+		requestA = "permission-shared-id"
+		requestB = "permission-shared-id"
+		hostA    = "java-session-a"
+		hostB    = "java-session-b"
+	)
+
+	newProcess := func(socket, key, requestID, hostSessionID string) (
+		*Engine, *SessionHostRouter, *recordingHostAgentSession, *APIServer,
+	) {
+		platform := &routedTestPlatform{name: "feishu"}
+		agentSession := &recordingHostAgentSession{hostSessionID: hostSessionID}
+		engine := NewEngine("project-a", &stubAgent{}, []Platform{platform}, "", LangEnglish)
+		router := NewSessionHostRouter(dataDir, "project-a", socket)
+		engine.SetSessionHostRouter(router)
+		route, registerErr := router.RegisterRoute(key)
+		if registerErr != nil {
+			t.Fatalf("RegisterRoute(%s) error = %v", key, registerErr)
+		}
+		engine.interactiveStates[key] = &interactiveState{
+			agentSession: agentSession, platform: platform, replyCtx: key,
+			sessionHostRouteKey: key, sessionHostRouteGeneration: route.Generation,
+			pending: &pendingPermission{
+				RequestID: requestID, HostSessionID: hostSessionID,
+				ToolInput: map[string]any{"command": "pwd"}, Resolved: make(chan struct{}),
+			},
+		}
+		if _, registerErr = router.RegisterInteraction(
+			requestID, hostSessionID, key, route.Generation); registerErr != nil {
+			t.Fatalf("RegisterInteraction(%s) error = %v", requestID, registerErr)
+		}
+		server, serverErr := NewAPIServerAt(dataDir, socket)
+		if serverErr != nil {
+			t.Fatalf("NewAPIServerAt(%s) error = %v", socket, serverErr)
+		}
+		server.RegisterEngine("project-a", engine)
+		server.Start()
+		return engine, router, agentSession, server
+	}
+
+	engineA, _, sessionA, serverA := newProcess(
+		filepath.Join(socketDir, "a.sock"), keyA, requestA, hostA)
+	defer serverA.Stop()
+	engineB, _, sessionB, serverB := newProcess(
+		filepath.Join(socketDir, "b.sock"), keyB, requestB, hostB)
+	defer serverB.Stop()
+
+	click := func(receiver *Engine, key, requestID, hostSessionID string) InteractionOutcome {
+		result := make(chan InteractionOutcome, 1)
+		receiver.handleMessage(&routedTestPlatform{name: "feishu"}, &Message{
+			SessionKey: key, Platform: "feishu", Content: "allow",
+			IsPermissionResponse: true, IsInteractionResponse: true,
+			InteractionRequestID: requestID, InteractionSessionID: hostSessionID,
+			InteractionResult: result,
+		})
+		select {
+		case outcome := <-result:
+			return outcome
+		case <-time.After(2 * time.Second):
+			t.Fatalf("interaction %s timed out", requestID)
+			return InteractionOutcome{}
+		}
+	}
+
+	if outcome := click(engineA, keyB, requestB, hostA); !outcome.Stale {
+		t.Fatalf("mismatched Java session outcome = %#v, want stale", outcome)
+	}
+	if sessionA.calls != 0 || sessionB.calls != 0 {
+		t.Fatalf("mismatched Java session reached an agent: A=%d B=%d",
+			sessionA.calls, sessionB.calls)
+	}
+
+	if outcome := click(engineA, keyB, requestB, hostB); !outcome.Accepted {
+		t.Fatalf("process A receiving process B click outcome = %#v", outcome)
+	}
+	if sessionA.calls != 0 || sessionB.calls != 1 || sessionB.lastID != requestB {
+		t.Fatalf("B click crossed sessions: A calls=%d, B calls=%d id=%q",
+			sessionA.calls, sessionB.calls, sessionB.lastID)
+	}
+
+	if outcome := click(engineB, keyA, requestA, hostA); !outcome.Accepted {
+		t.Fatalf("process B receiving process A click outcome = %#v", outcome)
+	}
+	if sessionA.calls != 1 || sessionA.lastID != requestA || sessionB.calls != 1 {
+		t.Fatalf("A click crossed sessions: A calls=%d id=%q, B calls=%d",
+			sessionA.calls, sessionA.lastID, sessionB.calls)
+	}
+}
+
 func TestSessionHostRouterForwardsCompactToOwningSession(t *testing.T) {
 	dataDir := t.TempDir()
 	socketDir, err := os.MkdirTemp("/tmp", "cc-compact-route-")
@@ -675,6 +774,13 @@ func (p *mainChatRecordingPlatform) Reply(_ context.Context, _ any, content stri
 }
 
 type routeOwnedAgentSession struct{ events chan Event }
+
+type recordingHostAgentSession struct {
+	recordingAgentSession
+	hostSessionID string
+}
+
+func (s *recordingHostAgentSession) CurrentSessionID() string { return s.hostSessionID }
 
 func (s *routeOwnedAgentSession) Send(string, string, []ImageAttachment, []FileAttachment) error {
 	return nil

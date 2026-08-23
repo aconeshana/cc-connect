@@ -704,6 +704,7 @@ type modelSwitchState struct {
 // pendingPermission represents a permission request waiting for user response.
 type pendingPermission struct {
 	RequestID            string
+	HostSessionID        string
 	ToolName             string
 	ToolInput            map[string]any
 	InputPreview         string
@@ -1191,7 +1192,25 @@ func (e *Engine) DispatchRoutedMessage(platformName string, msg *Message) (Inter
 	if msg == nil {
 		return InteractionOutcome{}, fmt.Errorf("routed message is nil")
 	}
-	if e.sessionHostRouter != nil {
+	interactionRouteMatched := false
+	if e.sessionHostRouter != nil && msg.IsInteractionResponse && msg.InteractionRequestID != "" {
+		interactionRoute, err := e.sessionHostRouter.LookupInteraction(
+			msg.InteractionRequestID, msg.InteractionSessionID)
+		if err != nil {
+			return InteractionOutcome{}, fmt.Errorf("validate routed interaction owner: %w", err)
+		}
+		if interactionRoute != nil {
+			if !interactionRoute.Alive(e.sessionHostRouter.now()) ||
+				!e.sessionHostRouter.IsLocalInteraction(interactionRoute) ||
+				interactionRoute.SessionKey != msg.SessionKey ||
+				(msg.InteractionSessionID != "" &&
+					msg.InteractionSessionID != interactionRoute.HostSessionID) {
+				return InteractionOutcome{Stale: true}, nil
+			}
+			interactionRouteMatched = true
+		}
+	}
+	if e.sessionHostRouter != nil && !interactionRouteMatched {
 		route, err := e.sessionHostRouter.Lookup(msg.SessionKey)
 		if err != nil {
 			return InteractionOutcome{}, fmt.Errorf("validate routed message owner: %w", err)
@@ -3058,7 +3077,40 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if e.routeBaseChatToHostThread(p, msg) {
 		return
 	}
-	if !msg.CrossProcessRouted && e.sessionHostRouter != nil {
+	interactionRouteMatched := false
+	if !msg.CrossProcessRouted && e.sessionHostRouter != nil &&
+		msg.IsInteractionResponse && msg.InteractionRequestID != "" {
+		interactionRoute, err := e.sessionHostRouter.LookupInteraction(
+			msg.InteractionRequestID, msg.InteractionSessionID)
+		if err != nil {
+			slog.Warn("session-host interaction route lookup failed",
+				"request_id", msg.InteractionRequestID, "error", err)
+		} else if interactionRoute != nil {
+			if !interactionRoute.Alive(e.sessionHostRouter.now()) ||
+				interactionRoute.SessionKey != msg.SessionKey ||
+				(msg.InteractionSessionID != "" &&
+					msg.InteractionSessionID != interactionRoute.HostSessionID) {
+				msg.completeInteraction(InteractionOutcome{Stale: true})
+				return
+			}
+			interactionRouteMatched = true
+			if !e.sessionHostRouter.IsLocalInteraction(interactionRoute) {
+				outcome, forwardErr := e.sessionHostRouter.Forward(
+					e.ctx, interactionRoute.sessionRoute(), msg)
+				if forwardErr != nil {
+					slog.Error("session-host interaction forward failed",
+						"request_id", msg.InteractionRequestID,
+						"host_session_id", interactionRoute.HostSessionID,
+						"owner_socket", interactionRoute.SocketPath, "error", forwardErr)
+					msg.completeInteraction(InteractionOutcome{Error: forwardErr.Error()})
+					return
+				}
+				msg.completeInteraction(outcome)
+				return
+			}
+		}
+	}
+	if !msg.CrossProcessRouted && e.sessionHostRouter != nil && !interactionRouteMatched {
 		route, err := e.sessionHostRouter.Lookup(msg.SessionKey)
 		if err != nil {
 			slog.Warn("session-host route lookup failed", "session", msg.SessionKey, "error", err)
@@ -3677,6 +3729,49 @@ func (e *Engine) handleVoiceMessage(p Platform, msg *Message) {
 // Permission handling
 // ──────────────────────────────────────────────────────────────
 
+func (e *Engine) bindPendingInteractionRoute(
+	state *interactiveState, pending *pendingPermission, fallbackSessionKey string,
+) {
+	if state == nil || pending == nil {
+		return
+	}
+	state.mu.Lock()
+	state.pending = pending
+	routeKey := state.sessionHostRouteKey
+	routeGeneration := state.sessionHostRouteGeneration
+	agentSession := state.agentSession
+	state.mu.Unlock()
+
+	if routeKey == "" {
+		routeKey = fallbackSessionKey
+	}
+	if e.sessionHostRouter == nil || routeGeneration == 0 || agentSession == nil {
+		return
+	}
+	hostSessionID := strings.TrimSpace(agentSession.CurrentSessionID())
+	if hostSessionID == "" {
+		return
+	}
+	route, err := e.sessionHostRouter.RegisterInteraction(
+		pending.RequestID, hostSessionID, routeKey, routeGeneration)
+	if err != nil {
+		slog.Warn("register session-host interaction route failed",
+			"request_id", pending.RequestID, "host_session_id", hostSessionID,
+			"session", routeKey, "error", err)
+		return
+	}
+	if route != nil {
+		pending.HostSessionID = hostSessionID
+	}
+}
+
+func (e *Engine) deletePendingInteractionRoute(pending *pendingPermission) {
+	if e.sessionHostRouter == nil || pending == nil || pending.RequestID == "" {
+		return
+	}
+	e.sessionHostRouter.DeleteInteraction(pending.RequestID, pending.HostSessionID)
+}
+
 func (e *Engine) handlePendingPermission(p Platform, msg *Message, content string, interactiveKey string) bool {
 	iKey := interactiveKey
 	if iKey == "" {
@@ -3793,7 +3888,7 @@ found:
 			e.updateInteractionCardAndWait(previousPresentation,
 				e.answeredQuestionCard(previousPresentation, q.Question, answer))
 			nextPresentation := e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1,
-				pending.RequestID)
+				pending.RequestID, pending.HostSessionID)
 			e.attachInteractionCardPresentation(state, pending, nextPresentation)
 			return true
 		}
@@ -3824,6 +3919,7 @@ found:
 		state.mu.Lock()
 		state.pending = nil
 		state.mu.Unlock()
+		e.deletePendingInteractionRoute(pending)
 		pending.resolve()
 		return true
 	}
@@ -3898,6 +3994,7 @@ found:
 	state.mu.Lock()
 	state.pending = nil
 	state.mu.Unlock()
+	e.deletePendingInteractionRoute(pending)
 	pending.resolve()
 	presentation := pending.cardPresentation
 	pending.cardPresentation = nil
@@ -5695,20 +5792,19 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					ToolInput: event.ToolInputRaw, InputPreview: event.ToolInput,
 					Questions: event.Questions, Resolved: make(chan struct{}),
 				}
-				state.mu.Lock()
-				state.pending = pending
-				state.mu.Unlock()
+				e.bindPendingInteractionRoute(state, pending, sessionKey)
 				if isAskQuestion {
 					presentation := e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0,
-						event.RequestID)
+						event.RequestID, pending.HostSessionID)
 					e.attachInteractionCardPresentation(state, pending, presentation)
 				} else {
 					toolInput := truncateIf(event.ToolInput, e.display.ToolMaxLen)
 					prompt := fmt.Sprintf(e.i18n.T(MsgPermissionPrompt), event.ToolName, toolInput)
 					presentation := e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput,
 						PermissionPromptContext{
-							RequestID: event.RequestID,
-							UserInput: currentUserInput, Model: currentModel,
+							RequestID:     event.RequestID,
+							HostSessionID: pending.HostSessionID,
+							UserInput:     currentUserInput, Model: currentModel,
 							ReasoningEffort: currentEffort, WorkDir: workspaceDir,
 							PermissionMode: firstNonBlank(event.PermissionMode, currentPermissionMode),
 							ModelOutput:    strings.Join(textParts, ""), RecentTools: strings.Join(toolsUsed, ", "),
@@ -6523,13 +6619,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				Questions:    event.Questions,
 				Resolved:     make(chan struct{}),
 			}
-			state.mu.Lock()
-			state.pending = pending
-			state.mu.Unlock()
+			e.bindPendingInteractionRoute(state, pending, sessionKey)
 
 			if isAskQuestion {
 				presentation := e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0,
-					event.RequestID)
+					event.RequestID, pending.HostSessionID)
 				e.attachInteractionCardPresentation(state, pending, presentation)
 			} else {
 				permLimit := e.display.ToolMaxLen
@@ -6541,8 +6635,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				permissionMode := firstNonBlank(event.PermissionMode, currentPermissionMode)
 				presentation := e.sendPermissionPrompt(p, replyCtx, prompt, event.ToolName, toolInput,
 					PermissionPromptContext{
-						RequestID: event.RequestID,
-						UserInput: currentUserInput, Model: currentModel,
+						RequestID:     event.RequestID,
+						HostSessionID: pending.HostSessionID,
+						UserInput:     currentUserInput, Model: currentModel,
 						ReasoningEffort: currentEffort, WorkDir: workspaceDir,
 						PermissionMode: permissionMode, ModelOutput: strings.Join(textParts, ""),
 						RecentTools:           strings.Join(recentToolNames, ", "),
@@ -12849,6 +12944,7 @@ func (e *Engine) resolveOutboundSessionTarget(sessionKey string, hasAttachments 
 // the platform supports them. Fallback chain: InlineButtonSender → CardSender → plain text.
 type PermissionPromptContext struct {
 	RequestID             string
+	HostSessionID         string
 	UserInput             string
 	Model                 string
 	ReasoningEffort       string
@@ -12920,11 +13016,15 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 		body := e.permissionCardBody(toolName, toolInput, permissionContext)
 		callbackBody := e.permissionCallbackBody(toolName, toolInput)
 		extra := func(label, color string) map[string]string {
-			return map[string]string{
+			values := map[string]string{
 				"perm_label": label,
 				"perm_color": color,
 				"perm_body":  callbackBody,
 			}
+			if permissionContext.HostSessionID != "" {
+				values["host_session_id"] = permissionContext.HostSessionID
+			}
+			return values
 		}
 		allowBtn := CardButton{Text: e.i18n.T(MsgPermBtnAllow), Type: "primary", Value: allowAction,
 			Extra: extra("✅ "+e.i18n.T(MsgPermBtnAllow), "green")}
@@ -13066,14 +13166,18 @@ func ifThen(condition bool, yes, no string) string {
 // sendAskQuestionPrompt renders one question (by index) from the AskUserQuestion list.
 // qIdx is the 0-based index of the question to display.
 func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int,
-	requestIDs ...string) *interactionCardPresentation {
+	interactionIDs ...string) *interactionCardPresentation {
 	if qIdx >= len(questions) {
 		return nil
 	}
 	q := questions[qIdx]
 	requestID := ""
-	if len(requestIDs) > 0 {
-		requestID = requestIDs[0]
+	if len(interactionIDs) > 0 {
+		requestID = interactionIDs[0]
+	}
+	hostSessionID := ""
+	if len(interactionIDs) > 1 {
+		hostSessionID = interactionIDs[1]
 	}
 	total := len(questions)
 	otherLabel := e.i18n.T(MsgAskQuestionOtherButton)
@@ -13084,6 +13188,9 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 		"askq_custom_title":  e.i18n.T(MsgAskQuestionCustomTitle),
 		"askq_custom_prompt": e.i18n.T(MsgAskQuestionCustomPrompt),
 		"askq_custom_note":   e.i18n.T(MsgAskQuestionCustomNote),
+	}
+	if hostSessionID != "" {
+		otherExtra["host_session_id"] = hostSessionID
 	}
 
 	titleSuffix := ""
@@ -13121,10 +13228,14 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 					desc += " — " + opt.Description
 				}
 				answerData := AskQuestionAction(requestID, qIdx, i+1)
-				cb.ListItemBtnExtra(desc, opt.Label, "default", answerData, map[string]string{
+				extra := map[string]string{
 					"askq_label":    opt.Label,
 					"askq_question": q.Question,
-				})
+				}
+				if hostSessionID != "" {
+					extra["host_session_id"] = hostSessionID
+				}
+				cb.ListItemBtnExtra(desc, opt.Label, "default", answerData, extra)
 			}
 			cb.ListItemBtnExtra(e.i18n.T(MsgAskQuestionOther), otherLabel, "default",
 				otherAction, otherExtra)

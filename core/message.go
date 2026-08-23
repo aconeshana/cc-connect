@@ -400,6 +400,10 @@ type Message struct {
 	// the same chat/thread.
 	IsInteractionResponse bool
 	InteractionRequestID  string
+	// InteractionSessionID identifies the Java host session that published an
+	// interaction card. It prevents sibling cc-connect processes sharing one IM
+	// app from accepting each other's callbacks.
+	InteractionSessionID string
 	// InteractionResult lets synchronous card callbacks wait until the owning
 	// agent session has actually accepted or rejected the interaction. It is
 	// process-local and is deliberately omitted from routed JSON messages.

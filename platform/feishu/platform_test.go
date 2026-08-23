@@ -331,6 +331,7 @@ func TestInteractivePlatform_PermissionCardRejectsUnauthorizedOperator(t *testin
 			Operator: &callback.Operator{OpenID: "ou_other_member"},
 			Action: &callback.CallBackAction{Value: map[string]any{
 				"action": "perm:req-feishu-1:allow", "session_key": "feishu:oc_test_chat:root:om_root",
+				"host_session_id": "java-session-feishu-1",
 			}},
 			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
 		},
@@ -398,6 +399,7 @@ func TestInteractivePlatform_PermissionCardAllowsAuthorizedOperator(t *testing.T
 			Operator: &callback.Operator{OpenID: "ou_admin"},
 			Action: &callback.CallBackAction{Value: map[string]any{
 				"action": "perm:req-feishu-1:allow", "session_key": "feishu:oc_test_chat:root:om_root",
+				"host_session_id": "java-session-feishu-1",
 			}},
 			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
 		},
@@ -411,7 +413,8 @@ func TestInteractivePlatform_PermissionCardAllowsAuthorizedOperator(t *testing.T
 	select {
 	case msg := <-msgCh:
 		if msg.Content != "allow" || !msg.IsPermissionResponse || !msg.IsInteractionResponse ||
-			msg.InteractionRequestID != "req-feishu-1" {
+			msg.InteractionRequestID != "req-feishu-1" ||
+			msg.InteractionSessionID != "java-session-feishu-1" {
 			t.Fatalf("permission response message = %#v", msg)
 		}
 	case <-time.After(2 * time.Second):
@@ -444,6 +447,7 @@ func TestInteractivePlatform_AskQuestionOtherSwitchesCardToCustomInput(t *testin
 				"askq_custom_title":  "✏️ Custom answer",
 				"askq_custom_prompt": "Reply in this thread with your custom answer.",
 				"askq_custom_note":   "Your next text message will be submitted as this answer.",
+				"host_session_id":    "java-ask-session",
 			}},
 			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_card"},
 		},
@@ -466,7 +470,8 @@ func TestInteractivePlatform_AskQuestionOtherSwitchesCardToCustomInput(t *testin
 	select {
 	case msg := <-msgCh:
 		if msg.Content != "askq:req-other-feishu:0:other" || !msg.IsInteractionResponse ||
-			msg.InteractionRequestID != "req-other-feishu" || msg.InteractionResult == nil {
+			msg.InteractionRequestID != "req-other-feishu" ||
+			msg.InteractionSessionID != "java-ask-session" || msg.InteractionResult == nil {
 			t.Fatalf("AskUserQuestion Other message = %#v", msg)
 		}
 	case <-time.After(2 * time.Second):

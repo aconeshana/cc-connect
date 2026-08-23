@@ -24,6 +24,8 @@ const sessionHostRouteVersion = 1
 
 const defaultSessionHostRouteLease = 30 * time.Second
 
+const defaultSessionHostInteractionLease = 24 * time.Hour
+
 const (
 	defaultSessionHostClaimTTL           = 24 * time.Hour
 	defaultSessionHostClaimSweepInterval = time.Hour
@@ -43,6 +45,38 @@ type SessionHostRoute struct {
 	Generation uint64    `json:"generation"`
 	LeaseUntil time.Time `json:"lease_until"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// SessionHostInteractionRoute binds one permission/question request to the
+// exact cc-connect process and Java host session that published its card. IM
+// card callbacks can be delivered to any sibling WebSocket consumer, so the
+// chat session key alone is not sufficient when multiple terminal processes
+// are active.
+type SessionHostInteractionRoute struct {
+	Version       int       `json:"version"`
+	RequestID     string    `json:"request_id"`
+	HostSessionID string    `json:"host_session_id"`
+	SessionKey    string    `json:"session_key"`
+	Project       string    `json:"project"`
+	SocketPath    string    `json:"socket_path"`
+	OwnerToken    string    `json:"owner_token"`
+	LeaseUntil    time.Time `json:"lease_until"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func (route *SessionHostInteractionRoute) Alive(now time.Time) bool {
+	return route != nil && !route.LeaseUntil.IsZero() && now.Before(route.LeaseUntil)
+}
+
+func (route *SessionHostInteractionRoute) sessionRoute() *SessionHostRoute {
+	if route == nil {
+		return nil
+	}
+	return &SessionHostRoute{
+		Version: route.Version, SessionKey: route.SessionKey, Project: route.Project,
+		SocketPath: route.SocketPath, OwnerToken: route.OwnerToken,
+		Generation: 1, LeaseUntil: route.LeaseUntil, UpdatedAt: route.UpdatedAt,
+	}
 }
 
 func (route *SessionHostRoute) Alive(now time.Time) bool {
@@ -146,6 +180,146 @@ func (r *SessionHostRouter) Lookup(sessionKey string) (*SessionHostRoute, error)
 		return nil, nil
 	}
 	return r.lookupFile(sessionKey)
+}
+
+// RegisterInteraction binds one host-session/request pair to this process. The
+// pair remains unambiguous even when separate Java processes generate the same
+// request ID, and supported card callbacks carry both values.
+func (r *SessionHostRouter) RegisterInteraction(
+	requestID, hostSessionID, sessionKey string, routeGeneration uint64,
+) (*SessionHostInteractionRoute, error) {
+	requestID = strings.TrimSpace(requestID)
+	hostSessionID = strings.TrimSpace(hostSessionID)
+	sessionKey = strings.TrimSpace(sessionKey)
+	if r == nil || requestID == "" || hostSessionID == "" || sessionKey == "" ||
+		r.project == "" || r.localSocket == "" {
+		return nil, nil
+	}
+	if !r.Owns(sessionKey, routeGeneration) {
+		return nil, fmt.Errorf("cannot register interaction for unowned session-host route %q", sessionKey)
+	}
+	interactionDir := filepath.Join(r.routeDir, "interactions")
+	if err := os.MkdirAll(interactionDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create session-host interaction route directory: %w", err)
+	}
+	path := r.interactionPath(requestID, hostSessionID)
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	if err := lockFile(lock); err != nil {
+		return nil, err
+	}
+	defer unlockFile(lock)
+
+	now := r.now()
+	current, err := r.lookupInteractionFile(requestID, hostSessionID)
+	if err != nil {
+		current = nil
+	}
+	if current != nil && current.Alive(now) && current.OwnerToken != r.ownerToken {
+		return nil, ErrSessionHostRouteOwned
+	}
+	route := &SessionHostInteractionRoute{
+		Version: sessionHostRouteVersion, RequestID: requestID, HostSessionID: hostSessionID,
+		SessionKey: sessionKey, Project: r.project, SocketPath: r.localSocket,
+		OwnerToken: r.ownerToken, UpdatedAt: now,
+		LeaseUntil: now.Add(defaultSessionHostInteractionLease),
+	}
+	data, err := json.MarshalIndent(route, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode session-host interaction route: %w", err)
+	}
+	if err := AtomicWriteFile(path, data, 0o600); err != nil {
+		return nil, fmt.Errorf("save session-host interaction route: %w", err)
+	}
+	return route, nil
+}
+
+func (r *SessionHostRouter) LookupInteraction(
+	requestID, hostSessionID string,
+) (*SessionHostInteractionRoute, error) {
+	if r == nil || strings.TrimSpace(requestID) == "" {
+		return nil, nil
+	}
+	requestID = strings.TrimSpace(requestID)
+	hostSessionID = strings.TrimSpace(hostSessionID)
+	if hostSessionID != "" {
+		return r.lookupInteractionFile(requestID, hostSessionID)
+	}
+
+	interactionDir := filepath.Join(r.routeDir, "interactions")
+	entries, err := os.ReadDir(interactionDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read session-host interaction routes: %w", err)
+	}
+	var matched *SessionHostInteractionRoute
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(interactionDir, entry.Name()))
+		if readErr != nil {
+			continue
+		}
+		var route SessionHostInteractionRoute
+		if json.Unmarshal(data, &route) != nil || route.Version != sessionHostRouteVersion ||
+			route.RequestID != requestID || strings.TrimSpace(route.HostSessionID) == "" ||
+			strings.TrimSpace(route.SessionKey) == "" || strings.TrimSpace(route.Project) == "" ||
+			strings.TrimSpace(route.SocketPath) == "" || strings.TrimSpace(route.OwnerToken) == "" ||
+			!route.Alive(r.now()) {
+			continue
+		}
+		if matched != nil {
+			return nil, fmt.Errorf("ambiguous session-host interaction route for %q", requestID)
+		}
+		routeCopy := route
+		matched = &routeCopy
+	}
+	return matched, nil
+}
+
+func (r *SessionHostRouter) lookupInteractionFile(
+	requestID, hostSessionID string,
+) (*SessionHostInteractionRoute, error) {
+	data, err := os.ReadFile(r.interactionPath(requestID, hostSessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read session-host interaction route: %w", err)
+	}
+	var route SessionHostInteractionRoute
+	if err := json.Unmarshal(data, &route); err != nil {
+		return nil, fmt.Errorf("decode session-host interaction route: %w", err)
+	}
+	if route.Version != sessionHostRouteVersion || route.RequestID != requestID ||
+		route.HostSessionID != hostSessionID || strings.TrimSpace(route.SessionKey) == "" ||
+		strings.TrimSpace(route.Project) == "" || strings.TrimSpace(route.SocketPath) == "" ||
+		strings.TrimSpace(route.OwnerToken) == "" || route.LeaseUntil.IsZero() {
+		return nil, fmt.Errorf("invalid session-host interaction route for %q", requestID)
+	}
+	return &route, nil
+}
+
+func (r *SessionHostRouter) IsLocalInteraction(route *SessionHostInteractionRoute) bool {
+	return r == nil || route == nil ||
+		(route.SocketPath == r.localSocket && route.OwnerToken == r.ownerToken)
+}
+
+func (r *SessionHostRouter) DeleteInteraction(requestID, hostSessionID string) {
+	route, err := r.LookupInteraction(requestID, hostSessionID)
+	if err != nil || route == nil || !r.IsLocalInteraction(route) ||
+		(hostSessionID != "" && route.HostSessionID != hostSessionID) {
+		return
+	}
+	if err := os.Remove(r.interactionPath(requestID, route.HostSessionID)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("delete session-host interaction route", "request_id", requestID, "error", err)
+	}
 }
 
 // ActiveThreadRoutes returns the live Session Host thread owners beneath one
@@ -418,4 +592,9 @@ func (r *SessionHostRouter) ForwardCardAction(
 func (r *SessionHostRouter) routePath(sessionKey string) string {
 	sum := sha256.Sum256([]byte(sessionKey))
 	return filepath.Join(r.routeDir, hex.EncodeToString(sum[:])+".json")
+}
+
+func (r *SessionHostRouter) interactionPath(requestID, hostSessionID string) string {
+	sum := sha256.Sum256([]byte(hostSessionID + "\x00" + requestID))
+	return filepath.Join(r.routeDir, "interactions", hex.EncodeToString(sum[:])+".json")
 }
