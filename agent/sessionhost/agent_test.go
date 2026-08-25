@@ -932,6 +932,19 @@ func TestMapWireEventPreservesHostTurnAndPermissionContext(t *testing.T) {
 		permission.CustomMessage != "Review deletion" || permission.ToolDescription != "Runs a shell command" {
 		t.Fatalf("permission event = %#v known=%v err=%v", permission, known, err)
 	}
+
+	unsupportedRaw, _ := json.Marshal(interactionUnsupportedPayload{
+		RequestID: "sudo-1", InteractionKind: "sudo_password", Action: "complete_in_tui",
+	})
+	unsupported, known, err := mapWireEvent(frame{
+		Protocol: protocolName, Version: protocolVersion, Kind: frameKindEvent,
+		Name: eventInteractionUnsupported, SessionID: "s1", Payload: unsupportedRaw,
+	})
+	if err != nil || !known || unsupported.Type != core.EventInteractionUnsupported ||
+		unsupported.RequestID != "sudo-1" || unsupported.InteractionKind != "sudo_password" ||
+		unsupported.InteractionAction != "complete_in_tui" || unsupported.Content != "" {
+		t.Fatalf("unsupported interaction event = %#v known=%v err=%v", unsupported, known, err)
+	}
 }
 
 func TestSessionSendEncodesAttachments(t *testing.T) {

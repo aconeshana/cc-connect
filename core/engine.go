@@ -4995,6 +4995,14 @@ func formatHostUserInput(content string, lang Language) string {
 	return "💬 **" + NewI18n(lang).T(MsgTUIInputLabel) + "**\n\n" + content
 }
 
+func (e *Engine) interactionUnsupportedMessage(kind string) string {
+	feature := e.i18n.T(MsgInteractionGeneric)
+	if strings.TrimSpace(kind) == "sudo_password" {
+		feature = e.i18n.T(MsgInteractionSudoPassword)
+	}
+	return fmt.Sprintf(e.i18n.T(MsgInteractionUnsupported), feature)
+}
+
 func formatHostModel(model, effort string, lang Language) string {
 	label := "Model"
 	if lang == LangChinese || lang == LangTraditionalChinese {
@@ -5420,6 +5428,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 	var currentModel string
 	var currentEffort string
 	var currentPermissionMode string
+	unsupportedNotices := make(map[string]struct{})
 	toolCount := 0
 	var cp *compactProgressWriter
 	var pendingText strings.Builder
@@ -5770,6 +5779,18 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					"session", sessionKey,
 					"response_len", len(fullResponse))
 
+			case EventInteractionUnsupported:
+				if _, duplicate := unsupportedNotices[event.RequestID]; duplicate {
+					continue
+				}
+				unsupportedNotices[event.RequestID] = struct{}{}
+				state.mu.Lock()
+				p := state.platform
+				replyCtx := state.replyCtx
+				state.mu.Unlock()
+				e.sendForWorkspace(p, replyCtx,
+					e.interactionUnsupportedMessage(event.InteractionKind), workspaceDir)
+
 			case EventPermissionRequest:
 				// Application-owned sessions may begin a turn in the local PTY,
 				// so an IM-bound unsolicited reader is a real interactive endpoint.
@@ -5883,6 +5904,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var currentPermissionMode string
 	triggerAutoCompress := false
 	pendingSend := sendDone
+	unsupportedNotices := make(map[string]struct{})
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
@@ -6559,6 +6581,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					sessions.Save()
 				}
 			}
+
+		case EventInteractionUnsupported:
+			if _, duplicate := unsupportedNotices[event.RequestID]; duplicate {
+				break
+			}
+			unsupportedNotices[event.RequestID] = struct{}{}
+			sendWorkspace(state.platform, state.replyCtx,
+				e.interactionUnsupportedMessage(event.InteractionKind))
 
 		case EventPermissionRequest:
 			// extension_select is a Pi extension UI request routed via the

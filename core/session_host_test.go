@@ -1058,6 +1058,60 @@ func TestHostSessionThreadE2E_LocalInteractionResolutionUpdatesCards(t *testing.
 	}
 }
 
+func TestHostSessionThreadE2E_UnsupportedInteractionIsStandaloneAndDeduplicated(t *testing.T) {
+	const (
+		hostID    = "java-host-unsupported-e2e"
+		threadKey = "feishu:oc_project:root:om_unsupported_e2e"
+	)
+	platform := &hostThreadE2EPlatform{
+		stubTrackableCardPlatform: stubTrackableCardPlatform{stubCardPlatform: stubCardPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		}},
+		boundKey: threadKey, boundCtx: "thread-context",
+	}
+	hostSession := newHostThreadE2ESession(hostID)
+	agent := &hostThreadE2EAgent{events: make(chan HostSessionLifecycle, 2),
+		collaboration: make(chan HostSessionCollaboration, 2), session: hostSession}
+	engine := NewEngine("test", agent, []Platform{platform}, filepath.Join(t.TempDir(), "sessions.json"), LangChinese)
+	defer engine.Stop()
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	agent.collaboration <- HostSessionCollaboration{SessionID: hostID, Channel: "feishu",
+		Enabled: true, WorkDir: "/workspace/e2e", Origin: "local"}
+	waitForCondition(t, 3*time.Second, func() bool {
+		return engine.findBoundHostSessionKey(hostID) == threadKey
+	}, "unsupported interaction test session was not bound")
+
+	platform.clearSent()
+	beforeHistory := engine.sessions.GetOrCreateActive(threadKey).HistoryLen()
+	event := Event{Type: EventInteractionUnsupported, RequestID: "sudo-1",
+		InteractionKind: "sudo_password", InteractionAction: "complete_in_tui", SessionID: hostID}
+	hostSession.events <- event
+	hostSession.events <- event
+	waitForCondition(t, 3*time.Second, func() bool {
+		return len(platform.getSent()) == 1
+	}, "standalone unsupported-interaction notice was not sent")
+
+	sent := platform.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], "Sudo 密码输入") ||
+		!strings.Contains(sent[0], "本地 TUI") {
+		t.Fatalf("unsupported interaction notice = %#v", sent)
+	}
+	if strings.Contains(sent[0], "launchctl") {
+		t.Fatalf("unsupported interaction notice leaked command content: %q", sent[0])
+	}
+	if after := engine.sessions.GetOrCreateActive(threadKey).HistoryLen(); after != beforeHistory {
+		t.Fatalf("unsupported interaction changed history length from %d to %d", beforeHistory, after)
+	}
+	platform.stubCardPlatform.mu.Lock()
+	cardCount := len(platform.sentCards)
+	platform.stubCardPlatform.mu.Unlock()
+	if cardCount != 0 {
+		t.Fatalf("unsupported interaction entered card flow: %d cards", cardCount)
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, ready func() bool, message string) {
 	t.Helper()
 	deadline := time.After(timeout)

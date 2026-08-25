@@ -234,6 +234,9 @@ const (
 	MsgResumeNoMatch             MsgKey = "resume_no_match"
 	MsgResumeTerminalNotice      MsgKey = "resume_terminal_notice"
 	MsgTUIInputLabel             MsgKey = "tui_input_label"
+	MsgInteractionUnsupported    MsgKey = "interaction_unsupported"
+	MsgInteractionSudoPassword   MsgKey = "interaction_sudo_password"
+	MsgInteractionGeneric        MsgKey = "interaction_generic"
 	MsgHistoryEmpty              MsgKey = "history_empty"
 	MsgNameUsage                 MsgKey = "name_usage"
 	MsgNameSet                   MsgKey = "name_set"
@@ -1573,6 +1576,27 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "TUI 輸入",
 		LangJapanese:           "TUI 入力",
 		LangSpanish:            "Entrada de TUI",
+	},
+	MsgInteractionUnsupported: {
+		LangEnglish:            "⚠️ %s cannot be completed remotely. Complete it in the local TUI.",
+		LangChinese:            "⚠️ %s暂不支持远程处理，请在本地 TUI 中完成。",
+		LangTraditionalChinese: "⚠️ %s暫不支援遠端處理，請在本機 TUI 中完成。",
+		LangJapanese:           "⚠️ %sはリモートでは完了できません。ローカル TUI で操作してください。",
+		LangSpanish:            "⚠️ %s no se puede completar de forma remota. Complétalo en la TUI local.",
+	},
+	MsgInteractionSudoPassword: {
+		LangEnglish:            "Sudo password input",
+		LangChinese:            "Sudo 密码输入",
+		LangTraditionalChinese: "Sudo 密碼輸入",
+		LangJapanese:           "Sudo パスワード入力",
+		LangSpanish:            "Entrada de contraseña de sudo",
+	},
+	MsgInteractionGeneric: {
+		LangEnglish:            "This interaction",
+		LangChinese:            "此交互",
+		LangTraditionalChinese: "此互動",
+		LangJapanese:           "この操作",
+		LangSpanish:            "Esta interacción",
 	},
 	MsgHistoryEmpty: {
 		LangEnglish:            "No history in current session.",

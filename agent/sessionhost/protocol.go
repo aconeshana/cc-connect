@@ -33,20 +33,21 @@ const (
 	messageEffortSet          = "effort.set"
 	messageCompactRun         = "compact.run"
 
-	eventOutputText           = "output.text"
-	eventOutputThinking       = "output.thinking"
-	eventTurnStarted          = "turn.started"
-	eventTurnModel            = "turn.model"
-	eventToolStarted          = "tool.started"
-	eventToolCompleted        = "tool.completed"
-	eventInteractionRequested = "interaction.requested"
-	eventInteractionResolved  = "interaction.resolved"
-	eventTurnCompleted        = "turn.completed"
-	eventSessionError         = "session.error"
-	eventSessionActivated     = "session.activated"
-	eventSessionUpdated       = "session.updated"
-	eventSessionEnded         = "session.ended"
-	eventCollaborationChanged = "collaboration.changed"
+	eventOutputText             = "output.text"
+	eventOutputThinking         = "output.thinking"
+	eventTurnStarted            = "turn.started"
+	eventTurnModel              = "turn.model"
+	eventToolStarted            = "tool.started"
+	eventToolCompleted          = "tool.completed"
+	eventInteractionRequested   = "interaction.requested"
+	eventInteractionResolved    = "interaction.resolved"
+	eventInteractionUnsupported = "interaction.unsupported"
+	eventTurnCompleted          = "turn.completed"
+	eventSessionError           = "session.error"
+	eventSessionActivated       = "session.activated"
+	eventSessionUpdated         = "session.updated"
+	eventSessionEnded           = "session.ended"
+	eventCollaborationChanged   = "collaboration.changed"
 )
 
 type frame struct {
@@ -211,6 +212,12 @@ type outputTextPayload struct {
 	Content   string         `json:"content"`
 	Synthetic bool           `json:"synthetic,omitempty"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+type interactionUnsupportedPayload struct {
+	RequestID       string `json:"request_id"`
+	InteractionKind string `json:"interaction_kind"`
+	Action          string `json:"action"`
 }
 
 type outputThinkingPayload struct {

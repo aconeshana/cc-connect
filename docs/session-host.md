@@ -110,6 +110,7 @@ Current events:
 - `tool.completed`
 - `interaction.requested`
 - `interaction.resolved`
+- `interaction.unsupported`
 - `turn.completed`
 - `session.error`
 - `session.activated`
@@ -140,6 +141,13 @@ interaction request ID. The engine accepts them only when that ID matches the
 currently pending interaction. Legacy, missing, already-resolved, and otherwise
 stale callbacks are consumed without reaching `turn.submit`, so an old card can
 neither answer a newer interaction nor become an accidental user prompt.
+
+`interaction.unsupported` is a secret-free endpoint capability notice. It
+carries only the native request ID, interaction kind, and required client
+action. cc-connect renders it as a standalone localized message and never
+adds it to assistant text, session history, permission state, or model input.
+The initial `sudo_password` use reports `complete_in_tui`; the command and
+password are deliberately absent from the wire payload.
 
 Platforms use native buttons where their interaction model fits. Feishu uses
 buttons for permissions and single-choice questions; multi-select with a

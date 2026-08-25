@@ -483,6 +483,21 @@ func mapWireEvent(value frame) (core.Event, bool, error) {
 			DestructiveWarning: payload.DestructiveWarning, BlockedPath: payload.BlockedPath,
 			CustomMessage: payload.CustomMessage, ToolDescription: payload.ToolDescription,
 		}, true, err
+	case eventInteractionUnsupported:
+		payload, err := decodePayload[interactionUnsupportedPayload](value.Payload)
+		if err != nil {
+			return core.Event{}, true, err
+		}
+		if strings.TrimSpace(payload.RequestID) == "" ||
+			strings.TrimSpace(payload.InteractionKind) == "" ||
+			strings.TrimSpace(payload.Action) == "" {
+			return core.Event{}, true, fmt.Errorf("session-host: invalid unsupported interaction")
+		}
+		return core.Event{
+			Type: core.EventInteractionUnsupported, RequestID: payload.RequestID,
+			InteractionKind: payload.InteractionKind, InteractionAction: payload.Action,
+			SessionID: value.SessionID,
+		}, true, nil
 	case eventTurnCompleted:
 		payload, err := decodePayload[turnCompletedPayload](value.Payload)
 		return core.Event{Type: core.EventResult, Content: payload.Content, Done: payload.Done, SessionID: value.SessionID, InputTokens: payload.InputTokens, OutputTokens: payload.OutputTokens, CacheCreationInputTokens: payload.CacheCreationInputTokens, CacheReadInputTokens: payload.CacheReadInputTokens, Metadata: payload.Metadata}, true, err

@@ -439,15 +439,16 @@ func (m *Message) completeInteraction(outcome InteractionOutcome) {
 type EventType string
 
 const (
-	EventUserInput         EventType = "user_input"         // host-local user submission mirrored to IM
-	EventModel             EventType = "model"              // effective model selected for the current turn
-	EventText              EventType = "text"               // intermediate or final text
-	EventToolUse           EventType = "tool_use"           // tool invocation info
-	EventToolResult        EventType = "tool_result"        // tool execution result
-	EventResult            EventType = "result"             // final aggregated result
-	EventError             EventType = "error"              // error occurred
-	EventPermissionRequest EventType = "permission_request" // agent requests permission via stdio protocol
-	EventThinking          EventType = "thinking"           // thinking/processing status
+	EventUserInput              EventType = "user_input"              // host-local user submission mirrored to IM
+	EventModel                  EventType = "model"                   // effective model selected for the current turn
+	EventText                   EventType = "text"                    // intermediate or final text
+	EventToolUse                EventType = "tool_use"                // tool invocation info
+	EventToolResult             EventType = "tool_result"             // tool execution result
+	EventResult                 EventType = "result"                  // final aggregated result
+	EventError                  EventType = "error"                   // error occurred
+	EventPermissionRequest      EventType = "permission_request"      // agent requests permission via stdio protocol
+	EventInteractionUnsupported EventType = "interaction_unsupported" // remote endpoint requires local handling
+	EventThinking               EventType = "thinking"                // thinking/processing status
 )
 
 // UserQuestion represents a structured question from AskUserQuestion.
@@ -481,6 +482,8 @@ type Event struct {
 	ToolSuccess              *bool          // optional success flag for EventToolResult
 	SessionID                string         // agent-managed session ID for conversation continuity
 	RequestID                string         // unique request ID for EventPermissionRequest
+	InteractionKind          string         // feature name for EventInteractionUnsupported
+	InteractionAction        string         // required client action for EventInteractionUnsupported
 	Questions                []UserQuestion // populated when ToolName == "AskUserQuestion"
 	DecisionReasonType       string         // host-native permission reason discriminator
 	DecisionReasonDetail     string         // human-readable permission rule/mode/reason
