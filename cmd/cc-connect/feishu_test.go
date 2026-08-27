@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -88,6 +89,29 @@ func TestSaveQRCodeImage_InvalidPath(t *testing.T) {
 	err := saveQRCodeImage("https://example.com", "/nonexistent/dir/qr.png")
 	if err == nil {
 		t.Fatal("expected error for invalid path, got nil")
+	}
+}
+
+func TestWriteTerminalQRCodeFitsFeishuTUI(t *testing.T) {
+	// The Feishu onboarding endpoint currently returns a 56-character
+	// verification_uri_complete. Keep the fixture opaque so this test never
+	// creates or exposes a real device code.
+	verificationURL := "https://accounts.feishu.cn/" + strings.Repeat("x", 29)
+	if len(verificationURL) != 56 {
+		t.Fatalf("fixture length = %d, want 56", len(verificationURL))
+	}
+
+	var output bytes.Buffer
+	writeTerminalQRCode(&output, verificationURL)
+
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) > 21 {
+		t.Fatalf("QR height = %d rows, want at most 21", len(lines))
+	}
+	for row, line := range lines {
+		if width := len([]rune(line)); width > 41 {
+			t.Fatalf("QR row %d width = %d columns, want at most 41", row, width)
+		}
 	}
 }
 

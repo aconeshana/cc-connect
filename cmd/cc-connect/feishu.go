@@ -911,17 +911,19 @@ func tryPrintTerminalQRCode(content string) {
 	if content == "" {
 		return
 	}
-	qrterminal.GenerateWithConfig(content, qrterminal.Config{
-		Level:      qrterminal.M,
-		Writer:     os.Stdout,
-		HalfBlocks: false,
-		BlackChar:  "██",
-		WhiteChar:  "  ",
-		QuietZone:  4,
-	})
+	writeTerminalQRCode(os.Stdout, content)
 	if _, err := fmt.Fprintln(os.Stdout); err != nil {
 		return
 	}
+}
+
+func writeTerminalQRCode(writer io.Writer, content string) {
+	qrterminal.GenerateWithConfig(content, qrterminal.Config{
+		Level:      qrterminal.M,
+		Writer:     writer,
+		HalfBlocks: true,
+		QuietZone:  4,
+	})
 }
 
 func saveQRCodeImage(content, path string) error {
