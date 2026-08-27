@@ -418,14 +418,7 @@ func TestHandleCronExec_TriggersJob(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(platform.getSent()) >= 2 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for local api trigger, sent=%v", platform.getSent())
+	waitForCronRunCompletion(t, store, job.ID, platform, "local api trigger")
 }
 
 func TestHandleCronExec_RunAliasRouteTriggersJob(t *testing.T) {
@@ -473,14 +466,34 @@ func TestHandleCronExec_RunAliasRouteTriggersJob(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 
+	waitForCronRunCompletion(t, store, job.ID, platform, "local api alias trigger")
+}
+
+func waitForCronRunCompletion(
+	t *testing.T,
+	store *CronStore,
+	jobID string,
+	platform *stubCronReplyTargetPlatform,
+	description string,
+) {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(platform.getSent()) >= 2 {
+		store.mu.Lock()
+		completed := false
+		for _, job := range store.jobs {
+			if job.ID == jobID {
+				completed = !job.LastRun.IsZero()
+				break
+			}
+		}
+		store.mu.Unlock()
+		if completed && len(platform.getSent()) >= 2 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for local api alias trigger, sent=%v", platform.getSent())
+	t.Fatalf("timed out waiting for %s, sent=%v", description, platform.getSent())
 }
 
 func TestHandleCronExec_ProjectMissingIsBadRequest(t *testing.T) {
