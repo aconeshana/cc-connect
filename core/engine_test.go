@@ -1,9 +1,11 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -7494,6 +7496,27 @@ func (s *failingRespondPermissionSession) RespondPermission(_ string, _ Permissi
 	return s.err
 }
 
+// syncBuffer is a mutex-guarded bytes.Buffer for use as an slog output sink
+// that is written from a background goroutine (the engine loop) and polled
+// from the test goroutine concurrently — a plain bytes.Buffer is not safe
+// for that and trips `go test -race`.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // TestProcessInteractiveEvents_AutoApproveLogsRespondPermissionFailure covers
 // a regression where the approve-all fast path in processInteractiveEvents
 // discarded the RespondPermission error via `_ = ...` with no logging at
@@ -7516,8 +7539,10 @@ func TestProcessInteractiveEvents_AutoApproveLogsRespondPermissionFailure(t *tes
 	}
 	e.interactiveStates[key] = state
 
-	buf, restore := captureSlog(t)
-	defer restore()
+	buf := &syncBuffer{}
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prevLogger)
 
 	sendDone := make(chan error, 1)
 	go func() { sendDone <- sess.Send("do it", "m-approve-all", nil, nil) }()
