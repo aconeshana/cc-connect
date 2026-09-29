@@ -6610,10 +6610,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			if autoApprove && !isAskQuestion {
 				slog.Debug("auto-approving (approve-all)", "request_id", event.RequestID, "tool", event.ToolName)
-				_ = state.agentSession.RespondPermission(event.RequestID, PermissionResult{
+				if err := state.agentSession.RespondPermission(event.RequestID, PermissionResult{
 					Behavior:     "allow",
 					UpdatedInput: event.ToolInputRaw,
-				})
+				}); err != nil {
+					slog.Error("interactive: failed to auto-approve permission", "error", err, "request_id", event.RequestID, "tool", event.ToolName)
+				}
 				continue
 			}
 

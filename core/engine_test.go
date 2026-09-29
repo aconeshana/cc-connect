@@ -7483,6 +7483,81 @@ func TestProcessInteractiveEvents_PermissionCardIncludesForegroundTurnContext(t 
 	}
 }
 
+// failingRespondPermissionSession returns an error from RespondPermission so
+// tests can verify the caller does not silently swallow it.
+type failingRespondPermissionSession struct {
+	blockingSendAgentSession
+	err error
+}
+
+func (s *failingRespondPermissionSession) RespondPermission(_ string, _ PermissionResult) error {
+	return s.err
+}
+
+// TestProcessInteractiveEvents_AutoApproveLogsRespondPermissionFailure covers
+// a regression where the approve-all fast path in processInteractiveEvents
+// discarded the RespondPermission error via `_ = ...` with no logging at
+// all (unlike the equivalent unsolicited-reader path, which logs via
+// slog.Error). A silent failure here means the agent-side (e.g. a Java
+// sessionhost TUI) permission prompt never gets dismissed and there is no
+// trace anywhere of why "Allow All" appeared to do nothing for that request.
+func TestProcessInteractiveEvents_AutoApproveLogsRespondPermissionFailure(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	sess := &failingRespondPermissionSession{
+		blockingSendAgentSession: *newBlockingSendSession("approve-all-failure"),
+		err:                      fmt.Errorf("socket closed"),
+	}
+	e := NewEngine("test", &controllableAgent{nextSession: sess}, []Platform{p}, "", LangChinese)
+
+	key := "feishu:approve-all:u1"
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{
+		agentSession: sess, platform: p, replyCtx: "ctx", approveAll: true,
+	}
+	e.interactiveStates[key] = state
+
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- sess.Send("do it", "m-approve-all", nil, nil) }()
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "m-approve-all", time.Now(), nil, sendDone, nil)
+		close(done)
+	}()
+
+	select {
+	case <-sess.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send did not reach blocking wait")
+	}
+	sess.events <- Event{
+		Type: EventPermissionRequest, RequestID: "req-approve-all-fail", ToolName: "mcp__chrome-devtools__list_pages",
+		ToolInputRaw: map[string]any{},
+	}
+
+	deadline := time.After(2 * time.Second)
+	for !strings.Contains(buf.String(), "req-approve-all-fail") {
+		select {
+		case <-deadline:
+			t.Fatalf("expected RespondPermission failure to be logged, got: %s", buf.String())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if !strings.Contains(buf.String(), "socket closed") {
+		t.Fatalf("expected logged error to include underlying cause, got: %s", buf.String())
+	}
+
+	close(sess.unblock)
+	sess.events <- Event{Type: EventResult, Content: "ok", Done: true}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("processInteractiveEvents did not complete")
+	}
+}
+
 func TestHandlePendingPermission_AskUserQuestion_SingleQuestion(t *testing.T) {
 	e := newTestEngine()
 	p := &stubPlatformEngine{n: "test"}
